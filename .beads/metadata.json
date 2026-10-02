@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "LocalLLMChat",
+  "project_id": "215a96c0-2c98-493f-a05c-c970a55d2020"
+}
