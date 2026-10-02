@@ -9,7 +9,6 @@ struct JobOutput: Equatable, Sendable {
 
 /// A unit of background work. The Gateway owns scheduling; jobs only do the work.
 protocol GatewayJob: Sendable {
-    var id: String { get }
     func run(config: DigestConfig, now: Date) async throws -> JobOutput
 }
 

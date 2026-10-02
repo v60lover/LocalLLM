@@ -14,7 +14,7 @@ final class ConversationRepositoryTests: XCTestCase {
         first.title = "First conversation"
         first.messages = [
             ChatMessage(role: .user, text: "Hello"),
-            ChatMessage(role: .assistant, text: "Hi", thinking: "reasoning")
+            ChatMessage(role: .assistant, text: "Hi")
         ]
         first.usedTokens = 17
         first.transcript = Transcript(entries: [
@@ -39,7 +39,6 @@ final class ConversationRepositoryTests: XCTestCase {
         XCTAssertEqual(loaded.conversations[0].usedTokens, 17)
         XCTAssertEqual(loaded.conversations[0].messages.map(\.role), [.user, .assistant])
         XCTAssertEqual(loaded.conversations[0].messages.map(\.text), ["Hello", "Hi"])
-        XCTAssertEqual(loaded.conversations[0].messages[1].thinking, "reasoning")
         XCTAssertEqual(loaded.conversations[0].transcript, first.transcript)
     }
 

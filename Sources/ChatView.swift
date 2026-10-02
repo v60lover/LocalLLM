@@ -52,7 +52,7 @@ struct ChatView: View {
                 }
                 .disabled(chat.isBusy || chat.models.isEmpty)
 
-                Button(chat.phase == .ready ? "Reload" :
+                Button(chat.isModelReady ? "Reload" :
                     (chat.cachedModelIDs.contains(chat.selectedModelID) ? "Open" : "Download")) {
                     chat.loadModel()
                 }
@@ -84,19 +84,34 @@ struct ChatView: View {
 
             HStack(spacing: 8) {
                 if chat.isBusy { ProgressView().controlSize(.small) }
-                Text(chat.phase.label)
+                Text(chat.statusLabel)
                     .font(.caption)
                     .foregroundStyle(statusColor)
                     .lineLimit(2)
             }
-            if chat.phase == .ready && !chat.toolsAvailable {
+            if let error = chat.generationError {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Reply failed: \(error)")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                    Button("Dismiss") { chat.dismissGenerationError() }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                }
+            }
+            if chat.isModelReady && !chat.toolsAvailable {
                 Text("This model does not support tool calls from chat.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            if case .downloading(let fraction) = chat.phase {
+            if case .downloading(let fraction) = chat.modelState {
                 ProgressView(value: fraction)
+            }
+            if let notice = chat.restoreNotice {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
             if let error = chat.persistenceError {
                 Text("Could not save conversations: \(error)")
@@ -148,12 +163,6 @@ struct ChatView: View {
                     (message.role == .tool ? "Tool" : "Assistant"))
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                if !message.thinking.isEmpty {
-                    DisclosureGroup("Reasoning") {
-                        Text(message.thinking).textSelection(.enabled)
-                    }
-                    .font(.caption)
-                }
                 if message.role == .tool {
                     HStack {
                         if message.isStreaming { ProgressView().controlSize(.small) }
@@ -214,30 +223,30 @@ struct ChatView: View {
             TextField("Message", text: $input, axis: .vertical)
                 .lineLimit(1...5)
                 .textFieldStyle(.roundedBorder)
-                .disabled(chat.phase != .ready)
+                .disabled(!chat.canSend)
                 .onSubmit(send)
 
-            if chat.phase == .generating {
+            if chat.isGenerating {
                 Button("Stop") { chat.stop() }
             } else {
                 Button("Send", action: send)
                     .buttonStyle(.borderedProminent)
-                    .disabled(chat.phase != .ready || input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(!chat.canSend || input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
 
             Button("New Chat") { chat.newChat() }
-                .disabled(chat.phase != .ready || chat.messages.isEmpty)
+                .disabled(!chat.canSend || chat.messages.isEmpty)
         }
         .padding()
     }
 
     private var statusColor: Color {
-        if case .failed = chat.phase { return .red }
+        if case .failed = chat.modelState { return .red }
         return .secondary
     }
 
     private func send() {
-        guard chat.phase == .ready else { return }
+        guard chat.canSend else { return }
         let text = input
         input = ""
         chat.send(text)

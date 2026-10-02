@@ -58,13 +58,7 @@ struct OpenModelPickerTool: Tool {
 }
 
 @MainActor
-final class AgentRuntime {
-    struct Outcome {
-        let text: String
-        let transcript: Transcript
-        let usedTokens: Int
-    }
-
+final class AgentRuntime: ChatRuntime {
     private let session: LanguageModelSession
     let supportsTools: Bool
 
@@ -88,26 +82,32 @@ final class AgentRuntime {
         }
     }
 
+    #if os(iOS)
+    let responseTokenBudget = 896
+    #else
+    let responseTokenBudget = 2048
+    #endif
+
     func generate(
         prompt: String,
         onSnapshot: @MainActor (String, Int) -> Void
-    ) async throws -> Outcome {
+    ) async throws -> GenerationOutcome {
         var answer = ""
-        #if os(iOS)
-        let options = GenerationOptions(maximumResponseTokens: 896)
-        #else
-        let options = GenerationOptions(maximumResponseTokens: 2048)
-        #endif
-        for try await snapshot in session.streamResponse(to: prompt, options: options) {
-            try Task.checkCancellation()
-            answer = snapshot.content
-            onSnapshot(
-                answer,
-                snapshot.usage.input.totalTokenCount + snapshot.usage.output.totalTokenCount
-            )
+        let options = GenerationOptions(maximumResponseTokens: responseTokenBudget)
+        do {
+            for try await snapshot in session.streamResponse(to: prompt, options: options) {
+                try Task.checkCancellation()
+                answer = snapshot.content
+                onSnapshot(
+                    answer,
+                    snapshot.usage.input.totalTokenCount + snapshot.usage.output.totalTokenCount
+                )
+            }
+        } catch LanguageModelSession.GenerationError.exceededContextWindowSize {
+            throw ChatRuntimeError.contextOverflow
         }
         let usage = session.usage
-        return Outcome(
+        return GenerationOutcome(
             text: answer,
             transcript: session.transcript,
             usedTokens: usage.input.totalTokenCount + usage.output.totalTokenCount

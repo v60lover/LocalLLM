@@ -207,7 +207,7 @@ final class NewsDigestJobTests: XCTestCase {
     private struct StubSummarizer: DigestSummarizing {
         let recorder: Recorder
         var result: Result<String, GatewayError> = .success("Short summary")
-        func summarize(items: [NewsItem], model: ModelReference, date: Date) async throws -> String {
+        func summarize(items: [NewsItem], model: ModelReference) async throws -> String {
             recorder.add("summarize:\(items.count):\(model.catalogID)")
             return try result.get()
         }

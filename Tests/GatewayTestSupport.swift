@@ -56,7 +56,6 @@ func enabledConfig(hour: Int = 8, minute: Int = 0) -> DigestConfig {
 
 final class StubJob: GatewayJob, @unchecked Sendable {
     typealias Behavior = @Sendable (DigestConfig, Date) async throws -> JobOutput
-    let id = "stub"
     private let lock = NSLock()
     private var calls = 0
     private var behavior: Behavior

@@ -21,50 +21,29 @@ final class ChatMarkdownSource: StreamedMarkdownSource, Sendable {
     }
 }
 
-@available(macOS 27, *)
 struct ChatMessage: Identifiable, Codable, Sendable {
     enum Role: String, Codable, Sendable { case user, assistant, tool }
 
     let id: UUID
     let role: Role
     var text: String
-    var thinking: String
     var isStreaming = false
     var markdownSource: ChatMarkdownSource?
 
     init(
-        id: UUID = UUID(), role: Role, text: String, thinking: String = "",
-        isStreaming: Bool = false,
+        id: UUID = UUID(), role: Role, text: String, isStreaming: Bool = false,
         markdownSource: ChatMarkdownSource? = nil
     ) {
         self.id = id
         self.role = role
         self.text = text
-        self.thinking = thinking
         self.isStreaming = isStreaming
         self.markdownSource = markdownSource
     }
 
+    /// Streaming state is transient and never persisted.
     private enum CodingKeys: String, CodingKey {
-        case id, role, text, thinking
-    }
-
-    init(from decoder: any Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        id = try values.decode(UUID.self, forKey: .id)
-        role = try values.decode(Role.self, forKey: .role)
-        text = try values.decode(String.self, forKey: .text)
-        thinking = try values.decodeIfPresent(String.self, forKey: .thinking) ?? ""
-        isStreaming = false
-        markdownSource = nil
-    }
-
-    func encode(to encoder: any Encoder) throws {
-        var values = encoder.container(keyedBy: CodingKeys.self)
-        try values.encode(id, forKey: .id)
-        try values.encode(role, forKey: .role)
-        try values.encode(text, forKey: .text)
-        try values.encode(thinking, forKey: .thinking)
+        case id, role, text
     }
 }
 
@@ -73,14 +52,21 @@ enum ContextBudget {
         guard let contextSize, contextSize > 0, let usedTokens else { return nil }
         return max(0, contextSize - usedTokens)
     }
+
+    /// True when another reply might not fit, so old turns should be dropped before sending.
+    static func isNearlyFull(contextSize: Int?, usedTokens: Int?, replyBudget: Int) -> Bool {
+        guard let remaining = remaining(contextSize: contextSize, usedTokens: usedTokens) else {
+            return false
+        }
+        return remaining < replyBudget + 256
+    }
 }
 
 @MainActor
 @Observable
-@available(macOS 27, *)
 final class ChatStore {
-    enum Phase: Equatable {
-        case idle, downloading(Double), loading, ready, generating
+    enum ModelState: Equatable {
+        case idle, downloading(Double), loading, ready
         case failed(String)
 
         var label: String {
@@ -89,42 +75,63 @@ final class ChatStore {
             case .downloading(let fraction): "Downloading: \(Int(fraction * 100))%"
             case .loading: "Loading model…"
             case .ready: "Ready · on-device processing"
-            case .generating: "Generating…"
             case .failed(let message): "Error: \(message)"
             }
         }
     }
 
-    private(set) var phase: Phase = .idle
+    /// Independent of the model: a failed reply leaves the model usable.
+    enum GenerationState: Equatable {
+        case idle, generating
+        case failed(String)
+    }
+
+    private(set) var modelState: ModelState = .idle
+    private(set) var generation: GenerationState = .idle
     private(set) var conversations: [ChatConversation] = []
-    private(set) var models: [CatalogEntry] = []
+    private(set) var models: [ChatModelOption] = []
     private(set) var cachedModelIDs: Set<String> = []
     private(set) var selectedModelID = "qwen3-0.6b"
     private(set) var selectedConversationID: UUID?
     var isModelPickerPresented = false
     private(set) var persistenceError: String?
+    /// Set when saved conversations could not be read at launch; stays until the app restarts.
+    private(set) var restoreNotice: String?
     private(set) var contextSize: Int?
 
     private let repository: ConversationRepository
-    private let executor: InProcessToolExecutor
-    private var loadedModel: KitLanguageModel?
-    private var runtime: AgentRuntime?
+    private let backend: any ChatBackend
+    private var loadedModel: (any ChatModelHandle)?
+    private var runtime: (any ChatRuntime)?
     private var generationTask: Task<Void, Never>?
     private var loadID = UUID()
     private var revision = 0
     private var didRestore = false
     private var lastSaveTask: Task<Void, Never>?
 
-    init(repository: ConversationRepository = ConversationRepository()) {
+    init(
+        repository: ConversationRepository = ConversationRepository(),
+        backend: any ChatBackend = CoreAIBackend()
+    ) {
         self.repository = repository
-        executor = InProcessToolExecutor()
+        self.backend = backend
     }
 
+    var isGenerating: Bool { generation == .generating }
+    var isModelReady: Bool { modelState == .ready }
+    var canSend: Bool { isModelReady && !isGenerating }
+
     var isBusy: Bool {
-        switch phase {
-        case .downloading, .loading, .generating: true
-        default: false
+        switch modelState {
+        case .downloading, .loading: true
+        default: isGenerating
         }
+    }
+
+    var statusLabel: String { isGenerating ? "Generating…" : modelState.label }
+
+    var generationError: String? {
+        if case .failed(let message) = generation { message } else { nil }
     }
 
     var messages: [ChatMessage] { activeIndex.map { conversations[$0].messages } ?? [] }
@@ -138,16 +145,18 @@ final class ChatStore {
               ) else {
             return "Context window: \(contextSize.formatted()) tokens"
         }
-        return "≈\(remaining.formatted()) / \(contextSize.formatted()) tokens left"
+        var label = "≈\(remaining.formatted()) / \(contextSize.formatted()) tokens left"
+        if (conversations[index].droppedTurns ?? 0) > 0 { label += " · older messages trimmed" }
+        return label
     }
 
     #if os(macOS)
     /// The selected model in a form the background Gateway can resolve on its own.
     var gatewayModelReference: ModelReference? {
-        guard let entry = models.first(where: { $0.id == selectedModelID }),
-              let id = entry.modelID else { return nil }
+        guard let option = models.first(where: { $0.id == selectedModelID }),
+              let source = option.source else { return nil }
         return ModelReference(
-            catalogID: entry.id, repo: id.repo, path: id.path, revision: id.revision
+            catalogID: option.id, repo: source.repo, path: source.path, revision: source.revision
         )
     }
 
@@ -172,10 +181,12 @@ final class ChatStore {
                     }
                 }
             }
+        } catch let error as ConversationRepositoryError {
+            restoreNotice = error.localizedDescription
         } catch {
             persistenceError = error.localizedDescription
         }
-        models = await ModelCatalog.load().available(.chat)
+        models = await backend.loadCatalog()
         if !models.contains(where: { $0.id == selectedModelID }) {
             selectedModelID = models.first?.id ?? selectedModelID
         }
@@ -204,10 +215,7 @@ final class ChatStore {
             conversations.append(conversation)
             selectedConversationID = conversation.id
         }
-        loadedModel = nil
-        runtime = nil
-        contextSize = nil
-        phase = .idle
+        resetModel()
         saveState()
         if cachedModelIDs.contains(id) { loadModel() }
     }
@@ -217,53 +225,52 @@ final class ChatStore {
             return
         }
         selectedConversationID = id
+        generation = .idle
         if selectedModelID != conversation.modelID {
             selectedModelID = conversation.modelID
-            loadedModel = nil
-            runtime = nil
-            contextSize = nil
-            phase = .idle
+            resetModel()
             if cachedModelIDs.contains(selectedModelID) { loadModel() }
         } else if let loadedModel {
-            runtime = makeRuntime(model: loadedModel)
+            runtime = makeRuntime(model: loadedModel, transcript: conversation.transcript)
         }
         saveState()
     }
 
     func loadModel() {
-        guard !isBusy, let entry = models.first(where: { $0.id == selectedModelID }),
-              let modelID = entry.modelID else { return }
+        guard !isBusy, let option = models.first(where: { $0.id == selectedModelID }) else {
+            return
+        }
         let requestID = UUID()
         loadID = requestID
         runtime = nil
         loadedModel = nil
-        phase = .loading
+        generation = .idle
+        modelState = .loading
         Task {
             do {
-                let url = try await ModelStore.default.download(modelID) { progress in
+                let handle = try await backend.load(option) { fraction in
                     Task { @MainActor in
                         guard self.loadID == requestID else { return }
-                        self.phase = progress.fraction < 1
-                            ? .downloading(progress.fraction) : .loading
+                        self.modelState = fraction < 1 ? .downloading(fraction) : .loading
                     }
                 }
                 guard loadID == requestID else { return }
-                let model = try await KitLanguageModel(bundleAt: url)
-                guard loadID == requestID else { return }
-                loadedModel = model
-                contextSize = Self.readContextSize(from: url)
-                runtime = makeRuntime(model: model)
-                cachedModelIDs.insert(selectedModelID)
-                phase = .ready
+                loadedModel = handle
+                contextSize = handle.contextSize
+                runtime = makeRuntime(
+                    model: handle, transcript: activeIndex.flatMap { conversations[$0].transcript }
+                )
+                cachedModelIDs.insert(option.id)
+                modelState = .ready
             } catch {
                 guard loadID == requestID else { return }
-                phase = .failed(error.localizedDescription)
+                modelState = .failed(error.localizedDescription)
             }
         }
     }
 
     func send(_ input: String) {
-        guard phase == .ready, let runtime, let index = activeIndex else { return }
+        guard canSend, runtime != nil, let index = activeIndex else { return }
         let prompt = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return }
         let conversationID = conversations[index].id
@@ -272,38 +279,19 @@ final class ChatStore {
         }
         let source = ChatMarkdownSource()
         let answerID = UUID()
+        let baseTranscript = conversations[index].transcript
         conversations[index].messages.append(ChatMessage(role: .user, text: prompt))
         conversations[index].messages.append(ChatMessage(
             id: answerID, role: .assistant, text: "", isStreaming: true,
             markdownSource: source
         ))
-        phase = .generating
+        generation = .generating
         saveState()
         generationTask = Task {
-            do {
-                let result = try await runtime.generate(prompt: prompt) { snapshot, usedTokens in
-                    self.updateAnswer(id: answerID, in: conversationID, text: snapshot)
-                    if let position = self.conversations.firstIndex(where: { $0.id == conversationID }) {
-                        self.conversations[position].usedTokens = usedTokens
-                    }
-                }
-                if let position = conversations.firstIndex(where: { $0.id == conversationID }) {
-                    conversations[position].transcript = result.transcript
-                    conversations[position].usedTokens = result.usedTokens
-                }
-                updateAnswer(id: answerID, in: conversationID, text: result.text)
-                phase = .ready
-            } catch is CancellationError {
-                if let position = conversations.firstIndex(where: { $0.id == conversationID }) {
-                    conversations[position].transcript = runtime.transcript
-                }
-                phase = .ready
-            } catch {
-                if let position = conversations.firstIndex(where: { $0.id == conversationID }) {
-                    conversations[position].transcript = runtime.transcript
-                }
-                phase = .failed(error.localizedDescription)
-            }
+            await runGeneration(
+                prompt: prompt, answerID: answerID, conversationID: conversationID,
+                baseTranscript: baseTranscript
+            )
             finishAnswer(id: answerID, in: conversationID)
             await saveState().value
             generationTask = nil
@@ -311,30 +299,141 @@ final class ChatStore {
     }
 
     func stop() {
-        guard phase == .generating else { return }
+        guard isGenerating else { return }
         generationTask?.cancel()
     }
 
+    func dismissGenerationError() {
+        if case .failed = generation { generation = .idle }
+    }
+
     func newChat() {
-        guard phase == .ready, let loadedModel else { return }
+        guard canSend, let loadedModel else { return }
         let conversation = ChatConversation(modelID: selectedModelID)
         conversations.append(conversation)
         selectedConversationID = conversation.id
-        runtime = makeRuntime(model: loadedModel)
+        generation = .idle
+        runtime = makeRuntime(model: loadedModel, transcript: nil)
         saveState()
     }
+
+    // MARK: - Generation
+
+    /// Runs one reply. The conversation's transcript only ever advances on success; on failure it
+    /// is rolled back to `baseTranscript` so the model and the chat stay usable. A context overflow
+    /// drops the older half of the conversation and retries once.
+    private func runGeneration(
+        prompt: String, answerID: UUID, conversationID: UUID, baseTranscript: Transcript?
+    ) async {
+        guard var runtime, let handle = loadedModel else { return }
+        var base = baseTranscript
+        var didTrim = false
+
+        if let position = position(of: conversationID),
+           ContextBudget.isNearlyFull(
+               contextSize: contextSize, usedTokens: conversations[position].usedTokens,
+               replyBudget: runtime.responseTokenBudget
+           ),
+           let trimmed = trim(base, conversationID: conversationID) {
+            base = trimmed
+            runtime = replaceRuntime(handle: handle, transcript: base)
+        }
+
+        while true {
+            do {
+                let result = try await runtime.generate(prompt: prompt) { snapshot, usedTokens in
+                    self.updateAnswer(id: answerID, in: conversationID, text: snapshot)
+                    if let position = self.position(of: conversationID) {
+                        self.conversations[position].usedTokens = usedTokens
+                    }
+                }
+                if let position = position(of: conversationID) {
+                    conversations[position].transcript = result.transcript
+                    conversations[position].usedTokens = result.usedTokens
+                }
+                updateAnswer(id: answerID, in: conversationID, text: result.text)
+                generation = .idle
+            } catch is CancellationError {
+                if let position = position(of: conversationID) {
+                    conversations[position].transcript = runtime.transcript
+                }
+                generation = .idle
+            } catch ChatRuntimeError.contextOverflow where !didTrim {
+                didTrim = true
+                if let trimmed = trim(base, conversationID: conversationID) {
+                    base = trimmed
+                    runtime = replaceRuntime(handle: handle, transcript: base)
+                    updateAnswer(id: answerID, in: conversationID, text: "")
+                    continue
+                }
+                fail(ChatRuntimeError.contextOverflow, answerID: answerID,
+                     conversationID: conversationID, rollbackTo: base, handle: handle)
+            } catch {
+                fail(error, answerID: answerID, conversationID: conversationID,
+                     rollbackTo: base, handle: handle)
+            }
+            return
+        }
+    }
+
+    /// Drops the older half of `transcript`. Returns nil when there was nothing left to drop.
+    private func trim(_ transcript: Transcript?, conversationID: UUID) -> Transcript? {
+        guard let transcript, let position = position(of: conversationID) else { return nil }
+        let result = TranscriptTrimmer.dropOldestHalf(of: transcript)
+        guard result.droppedTurns > 0 else { return nil }
+        conversations[position].transcript = result.transcript
+        conversations[position].droppedTurns = (conversations[position].droppedTurns ?? 0)
+            + result.droppedTurns
+        conversations[position].usedTokens = nil
+        return result.transcript
+    }
+
+    private func replaceRuntime(
+        handle: any ChatModelHandle, transcript: Transcript?
+    ) -> any ChatRuntime {
+        let fresh = makeRuntime(model: handle, transcript: transcript)
+        runtime = fresh
+        return fresh
+    }
+
+    private func fail(
+        _ error: any Error, answerID: UUID, conversationID: UUID, rollbackTo base: Transcript?,
+        handle: any ChatModelHandle
+    ) {
+        if let position = position(of: conversationID) {
+            conversations[position].transcript = base
+            // Do not leave an empty "Assistant" bubble behind.
+            if let messageIndex = conversations[position].messages.firstIndex(where: { $0.id == answerID }),
+               conversations[position].messages[messageIndex].text.isEmpty {
+                conversations[position].messages[messageIndex].markdownSource?.finish()
+                conversations[position].messages.remove(at: messageIndex)
+            }
+        }
+        _ = replaceRuntime(handle: handle, transcript: base)
+        generation = .failed(error.localizedDescription)
+    }
+
+    // MARK: - Helpers
 
     private var activeIndex: Int? {
         conversations.firstIndex(where: { $0.id == selectedConversationID })
     }
 
-    private func makeRuntime(model: KitLanguageModel) -> AgentRuntime {
+    private func position(of conversationID: UUID) -> Int? {
+        conversations.firstIndex(where: { $0.id == conversationID })
+    }
+
+    private func resetModel() {
+        loadedModel = nil
+        runtime = nil
+        contextSize = nil
+        generation = .idle
+        modelState = .idle
+    }
+
+    private func makeRuntime(model: any ChatModelHandle, transcript: Transcript?) -> any ChatRuntime {
         let conversationID = selectedConversationID
-        let transcript = activeIndex.flatMap { conversations[$0].transcript }
-        return AgentRuntime(
-            model: model, transcript: transcript, executor: executor
-        ) {
-            [weak self] event in
+        return model.makeRuntime(transcript: transcript) { [weak self] event in
             await self?.handleToolEvent(event, conversationID: conversationID)
         }
     }
@@ -372,13 +471,6 @@ final class ChatStore {
         conversations[index].messages[messageIndex].markdownSource?.update(text)
     }
 
-    private func updateToolMessage(id: UUID, in conversationID: UUID, text: String) {
-        guard let index = conversations.firstIndex(where: { $0.id == conversationID }),
-              let messageIndex = conversations[index].messages.firstIndex(where: { $0.id == id })
-        else { return }
-        conversations[index].messages[messageIndex].text = text
-    }
-
     private func finishAnswer(id: UUID, in conversationID: UUID) {
         guard let index = conversations.firstIndex(where: { $0.id == conversationID }),
               let messageIndex = conversations[index].messages.firstIndex(where: { $0.id == id })
@@ -389,11 +481,7 @@ final class ChatStore {
     }
 
     private func refreshCachedModels() {
-        cachedModelIDs = Set(models.compactMap { entry in
-            guard let model = entry.modelID,
-                  ModelStore.default.localURL(for: model) != nil else { return nil }
-            return entry.id
-        })
+        cachedModelIDs = backend.cachedModelIDs(among: models)
     }
 
     func flushPersistence() async {
@@ -419,22 +507,5 @@ final class ChatStore {
         }
         lastSaveTask = task
         return task
-    }
-
-    private static func readContextSize(from url: URL) -> Int? {
-        struct Metadata: Decodable {
-            struct Language: Decodable {
-                let maxContextLength: Int
-                enum CodingKeys: String, CodingKey {
-                    case maxContextLength = "max_context_length"
-                }
-            }
-            let language: Language
-        }
-        let metadataURL = url.appendingPathComponent("metadata.json")
-        guard let data = try? Data(contentsOf: metadataURL),
-              let size = try? JSONDecoder().decode(Metadata.self, from: data).language.maxContextLength,
-              size > 0 else { return nil }
-        return size
     }
 }

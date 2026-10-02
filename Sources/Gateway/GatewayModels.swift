@@ -6,7 +6,6 @@ enum GatewayConstants {
     static let label = "com.example.localllmchat.gateway"
     static let machServiceName = label
     static let executableName = "LocalLLMGateway"
-    static let newsDigestJobID = "news-digest"
 }
 
 enum GatewayPaths {
@@ -49,6 +48,9 @@ struct DigestConfig: Codable, Equatable, Sendable {
     func validate() throws {
         guard (0..<24).contains(hour), (0..<60).contains(minute) else {
             throw GatewayError.invalidConfig("Time must be between 00:00 and 23:59.")
+        }
+        guard !outputDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw GatewayError.invalidConfig("Choose a folder for the digests.")
         }
         guard sources.count <= Self.maxSources else {
             throw GatewayError.invalidConfig("At most \(Self.maxSources) sources are allowed.")
@@ -129,7 +131,7 @@ enum GatewayError: LocalizedError, Equatable, Sendable {
         switch self {
         case .invalidConfig(let detail): detail
         case .noSources: "No news sources are configured."
-        case .noModelSelected: "No model selected. Choose and download a model in the chat, then save the settings."
+        case .noModelSelected: "No model selected. Choose and download a model in the chat."
         case .modelNotDownloaded(let id): "Model “\(id)” is not downloaded. Open it in the chat to download it."
         case .modelUnavailable(let detail): "Could not open the model: \(detail)"
         case .summarizationFailed(let detail): "The model did not produce a digest: \(detail)"

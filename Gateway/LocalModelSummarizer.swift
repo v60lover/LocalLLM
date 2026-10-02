@@ -6,7 +6,7 @@ import FoundationModels
 /// The model is loaded per run and released afterwards: the Gateway is long-lived and idle
 /// almost all day, so it should not pin hundreds of MB of weights.
 struct LocalModelSummarizer: DigestSummarizing {
-    func summarize(items: [NewsItem], model: ModelReference, date: Date) async throws -> String {
+    func summarize(items: [NewsItem], model: ModelReference) async throws -> String {
         let id = ModelID(model.repo, path: model.path, revision: model.revision)
         guard let url = ModelStore.default.localURL(for: id) else {
             throw GatewayError.modelNotDownloaded(model.catalogID)

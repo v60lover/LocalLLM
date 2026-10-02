@@ -20,7 +20,7 @@ protocol NewsFetching: Sendable {
 }
 
 protocol DigestSummarizing: Sendable {
-    func summarize(items: [NewsItem], model: ModelReference, date: Date) async throws -> String
+    func summarize(items: [NewsItem], model: ModelReference) async throws -> String
 }
 
 struct DigestDocument: Equatable, Sendable {
@@ -318,7 +318,6 @@ enum PlainText {
 // MARK: - The job
 
 struct NewsDigestJob: GatewayJob {
-    let id = GatewayConstants.newsDigestJobID
     let fetcher: any NewsFetching
     let summarizer: any DigestSummarizing
     let publisher: any DocumentPublishing
@@ -340,7 +339,7 @@ struct NewsDigestJob: GatewayJob {
         guard !items.isEmpty else { throw GatewayError.noNews }
 
         try Task.checkCancellation()
-        let summary = try await summarizer.summarize(items: items, model: model, date: now)
+        let summary = try await summarizer.summarize(items: items, model: model)
         let document = DigestComposer.compose(
             summary: summary, items: items, failures: fetched.failures, date: now,
             calendar: clock.calendar

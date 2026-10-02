@@ -23,6 +23,25 @@ final class GatewayEngineTests: XCTestCase {
         return engine
     }
 
+    func testUnreadableStateIsMovedAsideInsteadOfOverwritten() throws {
+        try Data("not json".utf8).write(to: store.fileURL)
+
+        let state = store.load()
+        try store.save(state)
+
+        XCTAssertEqual(state, GatewayPersistedState())
+        let backups = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            .filter { $0.hasPrefix("state.corrupt-") }
+        XCTAssertEqual(backups.count, 1)
+        let kept = try Data(contentsOf: directory.appendingPathComponent(backups[0]))
+        XCTAssertEqual(String(decoding: kept, as: UTF8.self), "not json")
+    }
+
+    func testMissingStateFileIsNotTreatedAsCorruption() throws {
+        XCTAssertEqual(store.load(), GatewayPersistedState())
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [])
+    }
+
     func testTickBeforeSlotDoesNothingAndAtSlotRunsOnce() async throws {
         let clock = FakeClock(testDate(2026, 10, 2, 7, 59))
         let job = StubJob()

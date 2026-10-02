@@ -52,18 +52,22 @@ bd close <id>         # Complete work
 
 ## Build & Test
 
-_Add your build and test commands here_
+The Xcode project is generated from `project.yml` (`*.xcodeproj` is gitignored).
 
 ```bash
-# Example:
-# npm install
-# npm test
+xcodegen generate
+xcodebuild test -scheme LocalLLMChat -destination 'platform=macOS' \
+  DEVELOPMENT_TEAM=<your team id> -only-testing:LocalLLMChatTests
 ```
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+- `Sources/ChatStore.swift` — chat state (`ModelState` and `GenerationState` are separate); talks to the model layer only through `ChatBackend` / `ChatModelHandle` / `ChatRuntime` (`Sources/ChatBackend.swift`), so tests use fakes.
+- `Sources/AgentRuntime.swift` — CoreAIKit/FoundationModels session; `TranscriptTrimmer` drops old turns on context overflow.
+- `Sources/ConversationStore.swift` — persistence; unreadable files are quarantined (`Sources/Shared/FileQuarantine.swift`).
+- `Sources/Gateway/` + `Gateway/` — macOS background digest process; see README "Architecture".
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- Everything time- or I/O-dependent sits behind a protocol and is faked in `Tests/`.
+- Never overwrite a file that failed to decode; move it aside first.

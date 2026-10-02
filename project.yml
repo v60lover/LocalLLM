@@ -62,6 +62,7 @@ targets:
     sources:
       - path: Gateway
       - path: Sources/Gateway
+      - path: Sources/Shared
     dependencies:
       - package: coreai-kit
         product: CoreAIKit

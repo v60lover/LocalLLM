@@ -6,16 +6,22 @@ import SwiftUI
 @MainActor
 @Observable
 final class GatewaySettingsModel {
-    var draft = DigestConfig()
+    var draft = DigestConfig() {
+        didSet { if draftLoaded, draft != oldValue { scheduleAutoSave() } }
+    }
     private(set) var status: GatewayStatus?
     private(set) var isInstalled = false
     private(set) var errorMessage: String?
     private(set) var isWorking = false
+    /// Why the last automatic save was rejected. Unlike `errorMessage` it is not cleared by polling.
+    private(set) var saveError: String?
 
     private let client: any GatewayControlling
     private let installer: GatewayInstaller
     private var pollTask: Task<Void, Never>?
     private var draftLoaded = false
+    var currentModel: ModelReference?
+    private var saveTask: Task<Void, Never>?
 
     init(
         client: any GatewayControlling = GatewayXPCClient(),
@@ -27,6 +33,21 @@ final class GatewaySettingsModel {
 
     var isReachable: Bool { status != nil }
     var isDirty: Bool { status.map { $0.config != draft } ?? false }
+
+    /// A reason the current draft cannot be saved, found on the client before bothering the Gateway.
+    var validationMessage: String? {
+        do { try draft.validate(); return nil } catch { return error.localizedDescription }
+    }
+
+    enum SyncState: Equatable {
+        case saved, saving
+        case notSaved(String)
+    }
+
+    var syncState: SyncState {
+        if let reason = validationMessage ?? saveError { return .notSaved(reason) }
+        return isDirty ? .saving : .saved
+    }
 
     func start() {
         guard pollTask == nil else { return }
@@ -41,6 +62,31 @@ final class GatewaySettingsModel {
     func stop() {
         pollTask?.cancel()
         pollTask = nil
+        // Edits are applied automatically; make sure a pending one is not lost on close.
+        if saveTask != nil {
+            saveTask?.cancel()
+            saveTask = nil
+            Task { await save(model: nil) }
+        }
+    }
+
+    /// Persists every edit in the Gateway shortly after it is made, so there is no separate Save step to forget.
+    private func scheduleAutoSave() {
+        saveTask?.cancel()
+        saveTask = nil
+        saveError = nil
+        guard validationMessage == nil else { return }
+        saveTask = Task {
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled else { return }
+            saveTask = nil
+            await save(model: nil)
+        }
+    }
+
+    /// Keeps the Gateway's model in step with the one selected in the chat.
+    func adopt(model: ModelReference?) {
+        if let model, draft.model != model { draft.model = model }
     }
 
     func refresh() async {
@@ -51,6 +97,7 @@ final class GatewaySettingsModel {
             if !draftLoaded {
                 draft = latest.config
                 draftLoaded = true
+                adopt(model: currentModel)
             }
         } catch {
             status = nil
@@ -62,11 +109,22 @@ final class GatewaySettingsModel {
 
     func save(model: ModelReference?) async {
         if let model { draft.model = model }
-        await perform { try await self.client.send(.updateConfig(self.draft)) }
+        guard validationMessage == nil else { return }
+        let config = draft
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            status = try await client.send(.updateConfig(config))
+            saveError = nil
+            errorMessage = nil
+        } catch {
+            saveError = error.localizedDescription
+        }
     }
 
     func runNow(model: ModelReference?) async {
         if let model { draft.model = model }
+        guard validationMessage == nil else { return }
         await perform {
             if self.isDirty { _ = try await self.client.send(.updateConfig(self.draft)) }
             return try await self.client.send(.runNow)
@@ -146,7 +204,12 @@ struct GatewaySettingsView: View {
         }
         .frame(minWidth: 560, minHeight: 640)
         .task {
+            model.currentModel = currentModel
             model.start()
+        }
+        .onChange(of: currentModel) { _, new in
+            model.currentModel = new
+            model.adopt(model: new)
         }
         .onDisappear { model.stop() }
     }
@@ -213,7 +276,7 @@ struct GatewaySettingsView: View {
                 Text("This model is not downloaded yet. Open it in the chat, otherwise the Gateway cannot create a digest.")
                     .font(.caption).foregroundStyle(.orange)
             }
-            Text("The model selected in the chat at the time you save the settings is used.")
+            Text("The model selected in the chat is used; the Gateway follows when you switch models.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -221,14 +284,20 @@ struct GatewaySettingsView: View {
     private var resultSection: some View {
         Section("Run") {
             HStack {
-                Button("Save") { Task { await model.save(model: currentModel) } }
-                    .disabled(!model.isDirty || model.isWorking)
+                switch model.syncState {
+                case .saved:
+                    Text("Saved").font(.caption).foregroundStyle(.secondary)
+                case .saving:
+                    Text("Saving…").font(.caption).foregroundStyle(.secondary)
+                case .notSaved(let reason):
+                    Text("Not saved: \(reason)").font(.caption).foregroundStyle(.red)
+                }
                 if model.status?.isRunning == true {
                     ProgressView().controlSize(.small)
                     Button("Cancel") { Task { await model.cancelRun() } }
                 } else {
                     Button("Run Now") { Task { await model.runNow(model: currentModel) } }
-                        .disabled(model.isWorking)
+                        .disabled(model.isWorking || model.validationMessage != nil)
                 }
             }
             if let run = model.status?.lastRun {
