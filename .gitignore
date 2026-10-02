@@ -3,3 +3,5 @@
 .dolt/
 *.db
 .beads-credential-key
+.DS_Store
+xcuserdata/

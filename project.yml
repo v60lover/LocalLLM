@@ -1,0 +1,93 @@
+name: LocalLLMChat
+options:
+  bundleIdPrefix: com.example
+  createIntermediateGroups: true
+
+packages:
+  coreai-kit:
+    url: https://github.com/john-rocky/coreai-kit
+    exactVersion: 0.7.3
+  SwiftStreamingMarkdown:
+    url: https://github.com/microsoft/SwiftStreamingMarkdown
+    revision: 5f7c04e0558df6146f90d482edb62cb456986bda
+
+schemes:
+  LocalLLMChat:
+    build:
+      targets:
+        LocalLLMChat: all
+        LocalLLMGateway: all
+        LocalLLMChatTests: [test]
+    run:
+      config: Release
+    test:
+      config: Debug
+      targets:
+        - LocalLLMChatTests
+
+targets:
+  LocalLLMChat:
+    type: application
+    supportedDestinations: [iOS, macOS]
+    deploymentTarget:
+      iOS: "27.0"
+      macOS: "27.0"
+    sources:
+      - path: Sources
+    dependencies:
+      - package: coreai-kit
+        product: CoreAIKit
+      - package: SwiftStreamingMarkdown
+        product: SwiftStreamingMarkdown
+      - target: LocalLLMGateway
+        platformFilters: [macOS]
+        embed: true
+        codeSign: true
+        copy:
+          destination: executables
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.localllmchat
+        SWIFT_VERSION: "6.0"
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_APP_SANDBOX: "NO"
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+  LocalLLMGateway:
+    type: tool
+    platform: macOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Gateway
+      - path: Sources/Gateway
+    dependencies:
+      - package: coreai-kit
+        product: CoreAIKit
+    settings:
+      base:
+        PRODUCT_NAME: LocalLLMGateway
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.localllmchat.gateway
+        SWIFT_VERSION: "6.0"
+        GENERATE_INFOPLIST_FILE: "YES"
+        CREATE_INFOPLIST_SECTION_IN_BINARY: "YES"
+        INFOPLIST_KEY_NSAppleEventsUsageDescription: "Creates the daily news digest in Pages."
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_APP_SANDBOX: "NO"
+        SKIP_INSTALL: "YES"
+  LocalLLMChatTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Tests
+    dependencies:
+      - target: LocalLLMChat
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.localllmchat.tests
+        SWIFT_VERSION: "6.0"
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/LocalLLMChat.app/Contents/MacOS/LocalLLMChat"
+        BUNDLE_LOADER: "$(TEST_HOST)"
