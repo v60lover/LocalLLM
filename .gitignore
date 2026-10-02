@@ -11,3 +11,5 @@ xcuserdata/
 # Local tooling state
 .beads/
 .claude/
+CLAUDE.md
+AGENTS.md

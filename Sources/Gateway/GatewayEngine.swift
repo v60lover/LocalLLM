@@ -60,11 +60,19 @@ actor GatewayEngine {
     func updateConfig(_ config: DigestConfig) throws {
         try config.validate()
         guard config != state.config else { return }
+        let timeChanged = config.hour != state.config.hour || config.minute != state.config.minute
         state.config = config
-        // A changed configuration deserves a fresh attempt budget today, but never
-        // erases the fact that today's digest has already been delivered.
+        // A changed configuration deserves a fresh attempt budget today. Today's delivery is
+        // only forgotten when the time itself moved to a slot that is still ahead today:
+        // the user is asking for a digest at that time.
         state.progress.attempts = 0
         state.progress.retryAt = nil
+        let now = clock.now
+        let calendar = clock.calendar
+        if timeChanged, state.progress.lastSuccessDay == DigestSchedule.dayKey(now, calendar: calendar),
+           DigestSchedule.slot(onDayOf: now, config: config, calendar: calendar) > now {
+            state.progress.lastSuccessDay = nil
+        }
         try persist()
     }
 

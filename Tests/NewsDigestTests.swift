@@ -170,6 +170,25 @@ final class URLSessionNewsFetcherTests: XCTestCase {
     }
 }
 
+final class GoodNewsFilterTests: XCTestCase {
+    func testAcceptsOnlyAnUnambiguousGoodVerdict() {
+        for answer in ["GOOD", "good.", " Good news!", "Yes", "<think>\n\n</think>\n\nGOOD"] {
+            XCTAssertTrue(GoodNewsFilter.isGood(answer), answer)
+        }
+        for answer in ["OTHER", "Not good", "bad", "", "<think>it sounds good</think>OTHER", "Goodness, no"] {
+            XCTAssertFalse(GoodNewsFilter.isGood(answer), answer)
+        }
+    }
+
+    func testPromptCarriesTitleAndSummary() {
+        let item = NewsItem(title: "Reef recovers", summary: "Coral cover is up", link: "", source: "a", published: nil)
+        XCTAssertTrue(GoodNewsFilter.prompt(for: item).hasPrefix("News item: Reef recovers — Coral cover is up\n"))
+        var bare = item
+        bare.summary = ""
+        XCTAssertTrue(GoodNewsFilter.prompt(for: bare).hasPrefix("News item: Reef recovers\n"))
+    }
+}
+
 final class DigestComposerTests: XCTestCase {
     func testComposesTitleFileNameAndPlainTextBody() {
         var calendar = Calendar(identifier: .gregorian)
@@ -207,9 +226,11 @@ final class NewsDigestJobTests: XCTestCase {
     private struct StubSummarizer: DigestSummarizing {
         let recorder: Recorder
         var result: Result<String, GatewayError> = .success("Short summary")
-        func summarize(items: [NewsItem], model: ModelReference) async throws -> String {
+        /// Stands in for the model's verdict.
+        var isGood: @Sendable (NewsItem) -> Bool = { _ in true }
+        func summarize(items: [NewsItem], model: ModelReference) async throws -> DigestSummary {
             recorder.add("summarize:\(items.count):\(model.catalogID)")
-            return try result.get()
+            return DigestSummary(text: try result.get(), items: items.filter(isGood))
         }
     }
 
@@ -234,11 +255,12 @@ final class NewsDigestJobTests: XCTestCase {
 
     private func job(
         _ recorder: Recorder, fetch: Result<NewsFetchResult, GatewayError>? = nil,
-        summary: Result<String, GatewayError> = .success("Short summary"), publishFailure: GatewayError? = nil
+        summary: Result<String, GatewayError> = .success("Short summary"), publishFailure: GatewayError? = nil,
+        isGood: @escaping @Sendable (NewsItem) -> Bool = { _ in true }
     ) -> NewsDigestJob {
         NewsDigestJob(
             fetcher: StubFetcher(recorder: recorder, result: fetch ?? .success(feed)),
-            summarizer: StubSummarizer(recorder: recorder, result: summary),
+            summarizer: StubSummarizer(recorder: recorder, result: summary, isGood: isGood),
             publisher: StubPublisher(recorder: recorder, failure: publishFailure),
             clock: FakeClock(testDate(2026, 10, 2, 8))
         )
@@ -251,6 +273,35 @@ final class NewsDigestJobTests: XCTestCase {
         let output = try await job(recorder).run(config: config, now: testDate(2026, 10, 2, 8))
         XCTAssertEqual(recorder.events, ["fetch:1", "summarize:2:qwen3-0.6b", "publish:Digest-2026-10-02-0800.pages"])
         XCTAssertEqual(output, JobOutput(artifactPath: "/tmp/digests/Digest-2026-10-02-0800.pages", itemCount: 2))
+    }
+
+    func testOnlyGoodNewsReachesTheDocument() async throws {
+        final class Capture: DocumentPublishing, @unchecked Sendable {
+            private let lock = NSLock()
+            private var stored: DigestDocument?
+            var document: DigestDocument? { lock.withLock { stored } }
+            func publish(_ document: DigestDocument, into directory: URL) async throws -> URL {
+                lock.withLock { stored = document }
+                return directory.appendingPathComponent(document.fileName)
+            }
+        }
+        let capture = Capture()
+        let job = NewsDigestJob(
+            fetcher: StubFetcher(recorder: Recorder(), result: .success(feed)),
+            summarizer: StubSummarizer(recorder: Recorder(), isGood: { $0.title == "Two" }),
+            publisher: capture, clock: FakeClock(testDate(2026, 10, 2, 8))
+        )
+        let output = try await job.run(config: enabledConfig(), now: testDate(2026, 10, 2, 8))
+        XCTAssertEqual(output.itemCount, 1)
+        let body = try XCTUnwrap(capture.document?.body)
+        XCTAssertTrue(body.contains("• Two (a)"))
+        XCTAssertFalse(body.contains("• One (a)"))
+    }
+
+    func testNoGoodNewsIsAClearFailureAndNothingIsPublished() async {
+        let recorder = Recorder()
+        await assertFailure(job(recorder, isGood: { _ in false }), expected: .noGoodNews)
+        XCTAssertEqual(recorder.events, ["fetch:1", "summarize:2:qwen3-0.6b"])
     }
 
     func testMissingConfigurationFailsBeforeAnyWork() async {

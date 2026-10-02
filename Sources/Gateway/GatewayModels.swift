@@ -119,6 +119,7 @@ enum GatewayError: LocalizedError, Equatable, Sendable {
     case summarizationFailed(String)
     case allSourcesFailed([String])
     case noNews
+    case noGoodNews
     case outputDirectoryUnavailable(String)
     case pagesFailed(String)
     case timeout
@@ -138,6 +139,7 @@ enum GatewayError: LocalizedError, Equatable, Sendable {
         case .allSourcesFailed(let details):
             "Could not fetch news from any source. " + details.joined(separator: " ")
         case .noNews: "The sources responded, but there is no fresh news."
+        case .noGoodNews: "The model found no good news among today's items."
         case .outputDirectoryUnavailable(let detail): "The digest folder is unavailable: \(detail)"
         case .pagesFailed(let detail): detail
         case .timeout: "The run timed out."

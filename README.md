@@ -22,7 +22,7 @@ The Xcode scheme runs the Release configuration: generation in Debug is noticeab
 
 ## Daily news digest (Gateway, Mac only)
 
-A separate background process, `LocalLLMGateway`, collects news from RSS/Atom feeds every day, summarizes it with the selected local model, creates a Pages document and opens it, so the window stays open on the desktop. There are no notifications. The Gateway keeps working when the app is closed. The executable lives inside the app (`Contents/MacOS/LocalLLMGateway`) and is managed by launchd as the per-user agent `com.example.localllmchat.gateway`.
+A separate background process, `LocalLLMGateway`, collects news from RSS/Atom feeds every day, lets the selected local model pick out only the good news (one GOOD/OTHER verdict per item) and summarize it, creates a Pages document and opens it, so the window stays open on the desktop. There are no notifications. The Gateway keeps working when the app is closed. The executable lives inside the app (`Contents/MacOS/LocalLLMGateway`) and is managed by launchd as the per-user agent `com.example.localllmchat.gateway`.
 
 ### Setup
 
@@ -36,7 +36,7 @@ Log: `~/Library/Logs/LocalLLMChat/gateway.log`. State and schedule live in `~/Li
 ### Behavior
 
 - **Time zone.** The time and day boundaries are evaluated in the time zone currently set in macOS; it is shown in the settings next to the next run. The schedule is recomputed when the zone changes.
-- **One digest per day.** A successful scheduled run is remembered per calendar day: repeated checks and Gateway restarts do not duplicate the document. "Run Now" is an explicit action: it always creates a document and neither counts as the day's run nor consumes retry attempts.
+- **One digest per day.** A successful scheduled run is remembered per calendar day: repeated checks and Gateway restarts do not duplicate the document. "Run Now" is an explicit action: it always creates a document and neither counts as the day's run nor consumes retry attempts. Exception: if you move the time to a moment that is still ahead today, the day is re-armed and a digest is created at the new time.
 - **Sleep and power-off.** Nothing runs while the Mac sleeps or is off. After waking up the same day, a missed digest is created once (the schedule is checked at least every 30 seconds). Missed past days are not made up.
 - **Errors.** After a failure (no network, model not downloaded, no Pages access) the attempt is retried after 10 minutes, at most 3 times a day. Changing the settings resets the counter. The reason for the last error is shown in the settings.
 - **Restart.** If the Gateway exits during a run, that attempt is marked as interrupted on startup and retried immediately.

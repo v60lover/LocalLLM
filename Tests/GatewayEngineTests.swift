@@ -109,6 +109,51 @@ final class GatewayEngineTests: XCTestCase {
         XCTAssertEqual(status.lastRun?.trigger, .catchUp)
     }
 
+    func testMovingTheTimeToALaterSlotTodayRunsAgain() async throws {
+        let clock = FakeClock(testDate(2026, 10, 2, 8, 0))
+        let job = StubJob()
+        let engine = try await makeEngine(job, clock: clock)
+        await engine.tick()
+        await engine.waitUntilIdle()
+        XCTAssertEqual(job.callCount, 1)
+
+        clock.set(testDate(2026, 10, 2, 9, 0))
+        try await engine.updateConfig(enabledConfig(hour: 10))
+        var status = await engine.status()
+        XCTAssertEqual(status.nextRun, testDate(2026, 10, 2, 10))
+        await engine.tick()
+        await engine.waitUntilIdle()
+        XCTAssertEqual(job.callCount, 1, "must wait for the new slot")
+
+        clock.set(testDate(2026, 10, 2, 10, 0))
+        await engine.tick()
+        await engine.waitUntilIdle()
+        XCTAssertEqual(job.callCount, 2)
+        status = await engine.status()
+        XCTAssertEqual(status.lastRun?.trigger, .scheduled)
+        XCTAssertEqual(status.lastSuccessDay, "2026-10-02")
+    }
+
+    func testMovingTheTimeToAPastSlotOrChangingOtherSettingsKeepsTheDayDone() async throws {
+        let clock = FakeClock(testDate(2026, 10, 2, 8, 0))
+        let job = StubJob()
+        let engine = try await makeEngine(job, clock: clock)
+        await engine.tick()
+        await engine.waitUntilIdle()
+
+        clock.set(testDate(2026, 10, 2, 9, 0))
+        try await engine.updateConfig(enabledConfig(hour: 7))
+        var later = enabledConfig(hour: 7)
+        later.sources = ["https://example.com/feed"]
+        try await engine.updateConfig(later)
+        await engine.tick()
+        await engine.waitUntilIdle()
+        XCTAssertEqual(job.callCount, 1)
+        let status = await engine.status()
+        XCTAssertEqual(status.lastSuccessDay, "2026-10-02")
+        XCTAssertEqual(status.nextRun, testDate(2026, 10, 3, 7))
+    }
+
     func testFailureIsRetriedAfterDelayAtMostThreeTimes() async throws {
         let clock = FakeClock(testDate(2026, 10, 2, 8, 0))
         let job = StubJob(failingBehavior(.noNews))

@@ -19,8 +19,16 @@ protocol NewsFetching: Sendable {
     func fetch(sources: [URL]) async throws -> NewsFetchResult
 }
 
+struct DigestSummary: Equatable, Sendable {
+    var text: String
+    /// The good-news items the summary was written from, in their original order.
+    var items: [NewsItem]
+}
+
 protocol DigestSummarizing: Sendable {
-    func summarize(items: [NewsItem], model: ModelReference) async throws -> String
+    /// Keeps only the good news among `items` and summarizes it. Throws
+    /// `GatewayError.noGoodNews` when nothing qualifies.
+    func summarize(items: [NewsItem], model: ModelReference) async throws -> DigestSummary
 }
 
 struct DigestDocument: Equatable, Sendable {
@@ -105,6 +113,34 @@ enum NewsPreparation {
         components.scheme = nil
         let value = (components.host ?? "") + components.path
         return "l:" + value.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+}
+
+// MARK: - Good-news selection
+
+/// Prompt and answer parsing for the model's per-item verdict. One item per question keeps
+/// the task within reach of very small models, which lose track of long numbered lists.
+enum GoodNewsFilter {
+    static let instructions = """
+        You sort news for a good-news digest. Good news is clearly positive: progress, \
+        recovery, rescue, achievement, discovery, peace, kindness. News about deaths, violence, \
+        war, disasters, crime, crises, scandals or losses is not good news, and neither is \
+        neutral or mixed news. Answer with exactly one word: GOOD or OTHER.
+        """
+
+    static func prompt(for item: NewsItem) -> String {
+        "News item: \(item.title)" + (item.summary.isEmpty ? "" : " — \(item.summary)")
+            + "\nIs this good news? Answer GOOD or OTHER."
+    }
+
+    /// Anything that is not an unambiguous "good" counts as a rejection, so a confused
+    /// model yields a shorter digest rather than bad news in it.
+    static func isGood(_ response: String) -> Bool {
+        let answer = response
+            .replacingOccurrences(of: "(?s)<think>.*?</think>", with: " ", options: .regularExpression)
+            .lowercased()
+        let firstWord = answer.split(whereSeparator: { !$0.isLetter }).first.map(String.init)
+        return firstWord == "good" || firstWord == "yes"
     }
 }
 
@@ -340,8 +376,9 @@ struct NewsDigestJob: GatewayJob {
 
         try Task.checkCancellation()
         let summary = try await summarizer.summarize(items: items, model: model)
+        guard !summary.items.isEmpty else { throw GatewayError.noGoodNews }
         let document = DigestComposer.compose(
-            summary: summary, items: items, failures: fetched.failures, date: now,
+            summary: summary.text, items: summary.items, failures: fetched.failures, date: now,
             calendar: clock.calendar
         )
 
@@ -349,7 +386,7 @@ struct NewsDigestJob: GatewayJob {
         let url = try await publisher.publish(
             document, into: URL(fileURLWithPath: (directory as NSString).expandingTildeInPath, isDirectory: true)
         )
-        return JobOutput(artifactPath: url.path, itemCount: items.count)
+        return JobOutput(artifactPath: url.path, itemCount: summary.items.count)
     }
 }
 #endif
