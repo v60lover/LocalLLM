@@ -17,6 +17,7 @@ schemes:
       targets:
         LocalLLMChat: all
         LocalLLMGateway: all
+        LocalLLMWorker: all
         LocalLLMChatTests: [test]
     run:
       config: Release
@@ -74,6 +75,33 @@ targets:
         GENERATE_INFOPLIST_FILE: "YES"
         CREATE_INFOPLIST_SECTION_IN_BINARY: "YES"
         INFOPLIST_KEY_NSAppleEventsUsageDescription: "Creates the daily news digest in Pages."
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_APP_SANDBOX: "NO"
+        SKIP_INSTALL: "YES"
+  LocalLLMWorker:
+    type: xpc-service
+    platform: macOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Worker
+      - path: Sources/Shared
+    dependencies:
+      - package: coreai-kit
+        product: CoreAIKit
+    info:
+      path: Config/LocalLLMWorker-Info.plist
+      properties:
+        CFBundlePackageType: XPC!
+        CFBundleName: LocalLLMWorker
+        XPCService:
+          ServiceType: Application
+    settings:
+      base:
+        PRODUCT_NAME: LocalLLMWorker
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.localllmchat.worker
+        SWIFT_VERSION: "6.0"
+        INFOPLIST_FILE: Config/LocalLLMWorker-Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
         CODE_SIGN_STYLE: Automatic
         ENABLE_APP_SANDBOX: "NO"
         SKIP_INSTALL: "YES"

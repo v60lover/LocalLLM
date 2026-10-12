@@ -140,3 +140,140 @@ final class WorkerIPCTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(queue.takeBatch()).events, [.delta(requestID: b, text: "b", usedTokens: 1)])
     }
 }
+
+// MARK: WorkerEngine
+
+private struct StubModel: WorkerLoadedModel {
+    var contextSize: Int? = 2048
+    var session: any WorkerLanguageSession
+    func makeSession(instructions: String?, transcript: Data?) throws -> any WorkerLanguageSession { session }
+}
+
+private struct StubLoader: WorkerModelLoading {
+    var model: StubModel?
+    func load(_ location: WorkerModelLocation) async throws -> any WorkerLoadedModel {
+        guard let model else { throw WorkerFailure(kind: .modelLoadFailed, message: "nope") }
+        return model
+    }
+}
+
+private struct ScriptedSession: WorkerLanguageSession {
+    var snapshots: [String]
+    var failure: WorkerFailure?
+    var hangs = false
+
+    func respond(to prompt: String, options: WorkerGenerationOptions, onSnapshot: @Sendable (String, Int) -> Void) async throws -> WorkerSessionResult {
+        for (index, text) in snapshots.enumerated() { onSnapshot(text, index + 1) }
+        if hangs { try await Task.sleep(for: .seconds(30)) }
+        if let failure { throw failure }
+        return WorkerSessionResult(transcript: Data("t".utf8), usedTokens: snapshots.count)
+    }
+}
+
+private final class EventLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [WorkerEvent] = []
+    func append(_ event: WorkerEvent) { lock.lock(); stored.append(event); lock.unlock() }
+    var events: [WorkerEvent] { lock.lock(); defer { lock.unlock() }; return stored }
+
+    func waitForTerminal(count: Int = 1) async {
+        for _ in 0..<500 {
+            let terminal = events.filter {
+                switch $0 { case .delta: false; default: true }
+            }
+            if terminal.count >= count { return }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+}
+
+private final class CountingResidency: WorkerResidencyHolding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts = (acquired: 0, released: 0)
+    func acquire() { lock.lock(); counts.acquired += 1; lock.unlock() }
+    func release() { lock.lock(); counts.released += 1; lock.unlock() }
+    var snapshot: (acquired: Int, released: Int) { lock.lock(); defer { lock.unlock() }; return counts }
+}
+
+final class WorkerEngineTests: XCTestCase {
+    private func call(_ engine: WorkerEngine, _ request: WorkerRequest) async -> WorkerReply {
+        await engine.handle(WorkerRequestEnvelope(requestID: UUID(), request: request)).reply
+    }
+
+    private func readyEngine(
+        _ session: ScriptedSession, log: EventLog, residency: any WorkerResidencyHolding = NoResidencyHolder()
+    ) async -> (WorkerEngine, UUID) {
+        let engine = WorkerEngine(
+            loader: StubLoader(model: StubModel(session: session)), residency: residency, emit: { log.append($0) }
+        )
+        _ = await call(engine, .load(.path("/m")))
+        let sessionID = UUID()
+        _ = await call(engine, .openSession(sessionID: sessionID, instructions: nil, transcript: nil))
+        return (engine, sessionID)
+    }
+
+    func testGenerateStreamsAppendedDeltasThenFinished() async {
+        let log = EventLog()
+        let (engine, session) = await readyEngine(ScriptedSession(snapshots: ["He", "Hello", "Hello!"]), log: log)
+        let request = WorkerRequestEnvelope(requestID: UUID(), request: .generate(sessionID: session, prompt: "hi", options: WorkerGenerationOptions()))
+        let reply = await engine.handle(request)
+        XCTAssertEqual(reply.reply, .accepted)
+        await log.waitForTerminal()
+        let id = request.requestID
+        XCTAssertEqual(log.events, [
+            .delta(requestID: id, text: "He", usedTokens: 1),
+            .delta(requestID: id, text: "llo", usedTokens: 2),
+            .delta(requestID: id, text: "!", usedTokens: 3),
+            .finished(requestID: id, transcript: Data("t".utf8), usedTokens: 3),
+        ])
+    }
+
+    func testContextOverflowIsReportedAsFailedEvent() async {
+        let log = EventLog()
+        let overflow = WorkerFailure(kind: .contextOverflow, message: "full")
+        let (engine, session) = await readyEngine(ScriptedSession(snapshots: [], failure: overflow), log: log)
+        let request = WorkerRequestEnvelope(requestID: UUID(), request: .generate(sessionID: session, prompt: "x", options: WorkerGenerationOptions()))
+        _ = await engine.handle(request)
+        await log.waitForTerminal()
+        XCTAssertEqual(log.events, [.failed(requestID: request.requestID, overflow)])
+    }
+
+    func testSecondGenerateOnBusySessionIsRejectedAndCancelStopsTheFirst() async {
+        let log = EventLog()
+        let (engine, session) = await readyEngine(ScriptedSession(snapshots: [], hangs: true), log: log)
+        let first = WorkerRequestEnvelope(requestID: UUID(), request: .generate(sessionID: session, prompt: "a", options: WorkerGenerationOptions()))
+        let firstReply = await engine.handle(first)
+        XCTAssertEqual(firstReply.reply, .accepted)
+        let busy = await call(engine, .generate(sessionID: session, prompt: "b", options: WorkerGenerationOptions()))
+        guard case .failure(let failure) = busy else { return XCTFail("expected failure") }
+        XCTAssertEqual(failure.kind, .busy)
+
+        _ = await call(engine, .cancel(target: first.requestID))
+        await log.waitForTerminal()
+        guard case .failed(let id, let cancelled)? = log.events.last else { return XCTFail("expected failed event") }
+        XCTAssertEqual(id, first.requestID)
+        XCTAssertEqual(cancelled.kind, .cancelled)
+    }
+
+    func testResidencyIsHeldWhileLoadedAndReleasedOnUnload() async {
+        let residency = CountingResidency()
+        let log = EventLog()
+        let (engine, session) = await readyEngine(ScriptedSession(snapshots: []), log: log, residency: residency)
+        XCTAssertEqual(residency.snapshot.acquired, 1)
+        XCTAssertEqual(residency.snapshot.released, 0)
+        _ = await call(engine, .unload)
+        XCTAssertEqual(residency.snapshot.released, 1)
+        let after = await call(engine, .generate(sessionID: session, prompt: "x", options: WorkerGenerationOptions()))
+        guard case .failure(let failure) = after else { return XCTFail("expected failure") }
+        XCTAssertEqual(failure.kind, .modelNotLoaded)
+    }
+
+    func testLoadFailureAndProtocolMismatch() async {
+        let engine = WorkerEngine(loader: StubLoader(model: nil), emit: { _ in })
+        let load = await call(engine, .load(.path("/missing")))
+        XCTAssertEqual(load, .failure(WorkerFailure(kind: .modelLoadFailed, message: "nope")))
+        let hello = await call(engine, .hello(version: 99))
+        guard case .failure(let failure) = hello else { return XCTFail("expected failure") }
+        XCTAssertEqual(failure.kind, .unsupportedProtocol)
+    }
+}
