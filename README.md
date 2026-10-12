@@ -22,16 +22,16 @@ The Xcode scheme runs the Release configuration: generation in Debug is noticeab
 
 ## Daily news digest (Gateway, Mac only)
 
-A separate background process, `LocalLLMGateway`, collects news from RSS/Atom feeds every day, lets the selected local model pick out only the good news (one GOOD/OTHER verdict per item) and summarize it, creates a Pages document and opens it, so the window stays open on the desktop. There are no notifications. The Gateway keeps working when the app is closed. The executable lives inside the app (`Contents/MacOS/LocalLLMGateway`) and is managed by launchd as the per-user agent `com.example.localllmchat.gateway`.
+A separate background process, `LocalLLMGateway`, collects news from RSS/Atom feeds every day, lets the selected local model pick out only the good news (one GOOD/OTHER verdict per item) and summarize it, creates a Pages document and opens it, so the window stays open on the desktop. There are no notifications. The Gateway keeps working when the app is closed. It is a helper app inside the app (`Contents/Library/LoginItems/LocalLLMGateway.app`) and is managed by launchd as the per-user agent `com.example.localllmchat.gateway`.
 
 ### Setup
 
 1. Open the chat, choose a model and download it. The digest uses the model currently selected in the chat; the Gateway follows when you switch models.
-2. Click "Digest…" → "Install and Start". The app writes `~/Library/LaunchAgents/com.example.localllmchat.gateway.plist` and loads the agent (`launchctl bootstrap`). The agent starts at login and restarts after a crash.
+2. Click "Digest…" → "Install and Start". The app registers the agent with `SMAppService`; macOS may ask you to allow it in System Settings → General → Login Items & Extensions. The agent starts at login and restarts after a crash.
 3. Set the sources (one URL per line), the time and the output folder (default `~/Documents/LocalLLMChat Digests`), enable the digest. Changes are saved automatically; the Run section shows "Saved", "Saving…" or "Not saved: <reason>" (for example for an unfinished URL).
 4. Click "Run Now" to verify the whole path without waiting. On the first run macOS asks for permission for `LocalLLMGateway` to control Pages (System Settings → Privacy & Security → Automation); it may also ask for access to the Documents folder.
 
-Log: `~/Library/Logs/LocalLLMChat/gateway.log`. State and schedule live in `~/Library/Application Support/LocalLLMChat/Gateway/state.json`. There are no secrets or tokens.
+Log: unified logging, subsystem `com.example.localllmchat.gateway` (`log stream --predicate 'subsystem == "com.example.localllmchat.gateway"'`). State and schedule live in `~/Library/Application Support/LocalLLMChat/Gateway/state.json`. There are no secrets or tokens.
 
 ### Behavior
 
@@ -49,10 +49,10 @@ Log: `~/Library/Logs/LocalLLMChat/gateway.log`. State and schedule live in `~/Li
 #### Processes
 
 - **App (`LocalLLMChat`)**: the chat and the "Digest…" settings screen. It does not schedule or run anything itself.
-- **`LocalLLMGateway`**: a separate executable embedded in the app (`Contents/MacOS/LocalLLMGateway`).
+- **`LocalLLMGateway`**: a helper app embedded in the app (`Contents/Library/LoginItems/LocalLLMGateway.app`, `LSUIElement`). It must be an app bundle, not a bare executable, because the inference worker (`LocalLLMWorker.xpc` in its `Contents/XPCServices`) can only be looked up from inside a bundle.
   - launchd starts it as the per-user agent `com.example.localllmchat.gateway` (`RunAtLoad`, `KeepAlive`, graphical session only).
   - It runs independently of the chat window.
-  - `GatewayInstaller` installs and removes it (writes the plist, then `launchctl bootstrap` / `bootout`).
+  - `GatewayInstaller` installs and removes it via `SMAppService.agent`; the launchd plist ships in `Contents/Library/LaunchAgents` and points at the helper with `BundleProgram`. A plist written by older builds into `~/Library/LaunchAgents` is removed on install.
 
 #### IPC
 

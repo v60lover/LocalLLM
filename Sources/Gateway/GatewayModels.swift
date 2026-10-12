@@ -6,17 +6,16 @@ enum GatewayConstants {
     static let label = "com.example.localllmchat.gateway"
     static let machServiceName = label
     static let executableName = "LocalLLMGateway"
+    static let helperAppName = "LocalLLMGateway.app"
+    static let workerBundleName = "LocalLLMWorker.xpc"
+    /// File name of the agent plist in `Contents/Library/LaunchAgents` of the app.
+    static let agentPlistName = "\(label).plist"
 }
 
 enum GatewayPaths {
     static var supportDirectory: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("LocalLLMChat/Gateway", isDirectory: true)
-    }
-
-    static var logsDirectory: URL {
-        FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Logs/LocalLLMChat", isDirectory: true)
     }
 
     static var defaultDigestDirectory: String {

@@ -69,65 +69,152 @@ final class GatewayIPCTests: XCTestCase {
 }
 
 final class GatewayInstallerTests: XCTestCase {
+    private final class FakeRegistration: AgentRegistering, @unchecked Sendable {
+        var status: AgentRegistrationStatus = .notRegistered
+        var registerResult: AgentRegistrationStatus = .enabled
+        var registerError: Error?
+        private(set) var calls: [String] = []
+        func register() throws {
+            calls.append("register")
+            if let registerError { status = registerResult; throw registerError }
+            status = registerResult
+        }
+        func unregister() async throws {
+            calls.append("unregister")
+            status = .notRegistered
+        }
+    }
+
     private actor RecordingRunner: CommandRunning {
         private(set) var commands: [[String]] = []
-        var bootstrapStatus: Int32 = 0
-        func setBootstrapStatus(_ status: Int32) { bootstrapStatus = status }
         func run(_ executable: String, _ arguments: [String]) async throws -> ProcessRunner.Output {
             commands.append([executable] + arguments)
-            return ProcessRunner.Output(status: arguments.first == "bootstrap" ? bootstrapStatus : 0, stderr: bootstrapStatus == 0 ? "" : "boom")
+            return ProcessRunner.Output(status: 0, stderr: "")
         }
     }
 
-    private func makeInstaller(_ runner: RecordingRunner, root: URL, executable: Bool = true) throws -> GatewayInstaller {
-        let binary = root.appendingPathComponent("LocalLLMGateway")
-        if executable {
-            try Data("#!/bin/sh\n".utf8).write(to: binary)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
-        }
-        return GatewayInstaller(
-            executableURL: binary, launchAgentsDirectory: root.appendingPathComponent("LaunchAgents"),
-            logsDirectory: root.appendingPathComponent("Logs"), userID: 501, runner: runner
-        )
+    private struct Rig {
+        var installer: GatewayInstaller
+        var registration: FakeRegistration
+        var runner: RecordingRunner
+        var root: URL
     }
 
-    func testPlistDescribesAPerUserKeepAliveMachServiceInTheGUISession() throws {
+    /// Builds a fake app bundle; `complete: false` leaves out the helper executable.
+    private func makeRig(complete: Bool = true) throws -> Rig {
         let root = makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let installer = try makeInstaller(RecordingRunner(), root: root)
-        let plist = try XCTUnwrap(PropertyListSerialization.propertyList(from: installer.plistData(), format: nil) as? [String: Any])
+        let app = root.appendingPathComponent("LocalLLMChat.app", isDirectory: true)
+        let registration = FakeRegistration()
+        let runner = RecordingRunner()
+        var installer = GatewayInstaller(
+            appURL: app, registration: registration,
+            legacyLaunchAgentsDirectory: root.appendingPathComponent("LaunchAgents"), userID: 501,
+            runner: runner
+        )
+        if complete {
+            let fm = FileManager.default
+            try fm.createDirectory(at: installer.executableURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.createDirectory(at: installer.embeddedWorkerURL, withIntermediateDirectories: true)
+            try fm.createDirectory(at: installer.agentPlistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("#!/bin/sh\n".utf8).write(to: installer.executableURL)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: installer.executableURL.path)
+            try Data("<plist/>".utf8).write(to: installer.agentPlistURL)
+        }
+        installer.registration = registration
+        return Rig(installer: installer, registration: registration, runner: runner, root: root)
+    }
+
+    func testBundledAgentPlistDescribesAPerUserKeepAliveMachServiceInTheGUISession() throws {
+        // The test host is the app itself, so this checks the plist that actually ships.
+        let plistURL = GatewayInstaller.bundled().agentPlistURL
+        let plist = try XCTUnwrap(PropertyListSerialization.propertyList(
+            from: Data(contentsOf: plistURL), format: nil
+        ) as? [String: Any])
         XCTAssertEqual(plist["Label"] as? String, GatewayConstants.label)
-        XCTAssertEqual(plist["ProgramArguments"] as? [String], [installer.executableURL.path])
+        XCTAssertEqual(
+            plist["BundleProgram"] as? String,
+            "Contents/Library/LoginItems/\(GatewayConstants.helperAppName)/Contents/MacOS/\(GatewayConstants.executableName)"
+        )
+        XCTAssertNil(plist["ProgramArguments"])
         XCTAssertEqual(plist["KeepAlive"] as? Bool, true)
         XCTAssertEqual(plist["RunAtLoad"] as? Bool, true)
         XCTAssertEqual(plist["LimitLoadToSessionType"] as? String, "Aqua")
         XCTAssertEqual((plist["MachServices"] as? [String: Bool])?[GatewayConstants.machServiceName], true)
+        XCTAssertEqual(plistURL.lastPathComponent, "\(GatewayConstants.label).plist")
     }
 
-    func testInstallWritesPlistThenReloadsAgentAndUninstallRemovesIt() async throws {
-        let root = makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = RecordingRunner()
-        let installer = try makeInstaller(runner, root: root)
-        XCTAssertFalse(installer.isInstalled)
-        try await installer.install()
-        XCTAssertTrue(installer.isInstalled)
-        let commands = await runner.commands
-        XCTAssertEqual(commands.map { $0[1] }, ["bootout", "bootstrap"])
-        XCTAssertEqual(commands[1][2], "gui/501")
-        try await installer.uninstall()
-        XCTAssertFalse(installer.isInstalled)
+    func testBundledAppEmbedsTheGatewayHelperWithItsWorker() {
+        let installer = GatewayInstaller.bundled()
+        XCTAssertTrue(installer.executableExists, "helper executable missing at \(installer.executableURL.path)")
+        XCTAssertTrue(installer.workerEmbedded, "worker missing at \(installer.embeddedWorkerURL.path)")
+        // The service name the Gateway dials is the embedded bundle's identifier.
+        let worker = Bundle(url: installer.embeddedWorkerURL)
+        XCTAssertEqual(worker?.bundleIdentifier, WorkerConstants.serviceName)
     }
 
-    func testInstallFailsClearlyWithoutBundledExecutableOrWhenLaunchctlRejects() async throws {
-        let root = makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let missing = try makeInstaller(RecordingRunner(), root: root, executable: false)
-        await XCTAssertThrowsGatewayError { try await missing.install() }
+    func testInstallRegistersAgentAndUninstallUnregistersIt() async throws {
+        let rig = try makeRig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        XCTAssertFalse(rig.installer.isInstalled)
+        try await rig.installer.install()
+        XCTAssertTrue(rig.installer.isInstalled)
+        XCTAssertEqual(rig.registration.calls, ["register"])
+        try await rig.installer.uninstall()
+        XCTAssertFalse(rig.installer.isInstalled)
+        XCTAssertEqual(rig.registration.calls, ["register", "unregister"])
+    }
 
-        let runner = RecordingRunner()
-        await runner.setBootstrapStatus(5)
-        let installer = try makeInstaller(runner, root: root)
-        await XCTAssertThrowsGatewayError { try await installer.install() }
+    func testReinstallReloadsAnAlreadyRegisteredAgent() async throws {
+        let rig = try makeRig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        rig.registration.status = .enabled
+        try await rig.installer.install()
+        XCTAssertEqual(rig.registration.calls, ["unregister", "register"])
+    }
+
+    func testInstallFailsClearlyWhenTheBundleIsIncomplete() async throws {
+        let rig = try makeRig(complete: false)
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        await XCTAssertThrowsGatewayError { try await rig.installer.install() }
+        XCTAssertEqual(rig.registration.calls, [])
+    }
+
+    func testInstallReportsPendingApprovalAndKeepsTheRegistration() async throws {
+        let rig = try makeRig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        rig.registration.registerResult = .requiresApproval
+        rig.registration.registerError = NSError(domain: "SMAppServiceErrorDomain", code: 1)
+        do {
+            try await rig.installer.install()
+            XCTFail("expected an approval error")
+        } catch let error as GatewayError {
+            XCTAssertTrue(error.localizedDescription.contains("Login Items"), error.localizedDescription)
+        }
+        XCTAssertTrue(rig.installer.isInstalled, "a pending item still counts as installed")
+    }
+
+    func testInstallSurfacesARealRegistrationFailure() async throws {
+        let rig = try makeRig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        rig.registration.registerResult = .notRegistered
+        rig.registration.registerError = NSError(
+            domain: "SMAppServiceErrorDomain", code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "boom"]
+        )
+        await XCTAssertThrowsGatewayError { try await rig.installer.install() }
+        XCTAssertFalse(rig.installer.isInstalled)
+    }
+
+    func testInstallRemovesTheLegacyHandWrittenAgent() async throws {
+        let rig = try makeRig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let legacy = rig.installer.legacyPlistURL
+        try FileManager.default.createDirectory(at: legacy.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("<plist/>".utf8).write(to: legacy)
+        try await rig.installer.install()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacy.path))
+        let commands = await rig.runner.commands
+        XCTAssertEqual(commands.map { $0[1] }, ["bootout"])
+        XCTAssertEqual(commands[0][2], "gui/501/\(GatewayConstants.label)")
     }
 }

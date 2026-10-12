@@ -35,6 +35,13 @@ targets:
       macOS: "27.0"
     sources:
       - path: Sources
+      # launchd job for SMAppService.agent; BundleProgram points into LoginItems/.
+      - path: Config/com.example.localllmchat.gateway.plist
+        buildPhase:
+          copyFiles:
+            destination: wrapper
+            subpath: Contents/Library/LaunchAgents
+        platformFilter: macOS
     dependencies:
       - package: coreai-kit
         product: CoreAIKit
@@ -45,7 +52,8 @@ targets:
         embed: true
         codeSign: true
         copy:
-          destination: executables
+          destination: wrapper
+          subpath: Contents/Library/LoginItems
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.localllmchat
@@ -57,7 +65,9 @@ targets:
         MARKETING_VERSION: "1.0"
         CURRENT_PROJECT_VERSION: "1"
   LocalLLMGateway:
-    type: tool
+    # A helper .app (not a bare tool): XPC service lookup is relative to the main bundle, so
+    # the embedded worker is only visible from inside an app. See Spikes/EmbeddedXPC.
+    type: application
     platform: macOS
     deploymentTarget: "27.0"
     sources:
@@ -67,13 +77,19 @@ targets:
     dependencies:
       - package: coreai-kit
         product: CoreAIKit
+      - target: LocalLLMWorker
+        embed: true
+        codeSign: true
+        copy:
+          destination: wrapper
+          subpath: Contents/XPCServices
     settings:
       base:
         PRODUCT_NAME: LocalLLMGateway
         PRODUCT_BUNDLE_IDENTIFIER: com.example.localllmchat.gateway
         SWIFT_VERSION: "6.0"
         GENERATE_INFOPLIST_FILE: "YES"
-        CREATE_INFOPLIST_SECTION_IN_BINARY: "YES"
+        INFOPLIST_KEY_LSUIElement: "YES"
         INFOPLIST_KEY_NSAppleEventsUsageDescription: "Creates the daily news digest in Pages."
         CODE_SIGN_STYLE: Automatic
         ENABLE_APP_SANDBOX: "NO"
