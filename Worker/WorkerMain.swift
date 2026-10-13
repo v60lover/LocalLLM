@@ -75,6 +75,11 @@ final class WorkerService: NSObject, NSXPCListenerDelegate, WorkerXPCProtocol, @
             let box = SinkBox(sink: sink)
             Task { await pump.attach(box) }
         }
+        // The Gateway is the only client. If it goes away the worker must not linger with a model
+        // in memory: the resident-model transaction would otherwise keep the process alive.
+        // `_exit`, not `exit`: inference threads may still be running, and `exit` would run
+        // atexit handlers and static destructors underneath them.
+        connection.invalidationHandler = { _exit(0) }
         connection.resume()
         return true
     }
