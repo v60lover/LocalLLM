@@ -624,14 +624,52 @@ final class GatewayEventTests: XCTestCase {
     func testAnEventTypeFromANewerGatewayDecodesAsUnknownAndItsNeighboursStillApply() throws {
         let status = String(decoding: try GatewayWire.encoder.encode(makeStatus()), as: UTF8.self)
         let literal = """
-        {"version":2,"sequence":0,"events":[\
-        {"type":"chatDelta","requestID":"x","text":"hi","extra":[1,2]},\
+        {"version":3,"sequence":0,"events":[\
+        {"type":"someFutureEvent","requestID":"x","text":"hi","extra":[1,2]},\
         {"type":"status","status":\(status)}]}
         """
         let batch = try GatewayWire.decoder.decode(GatewayEventBatch.self, from: Data(literal.utf8))
         XCTAssertEqual(batch.events.count, 2)
-        XCTAssertEqual(batch.events[0], .unknown(type: "chatDelta"))
+        XCTAssertEqual(batch.events[0], .unknown(type: "someFutureEvent"))
         XCTAssertEqual(batch.events[1], .status(makeStatus()))
+    }
+
+    /// The chat events' bytes. The literals are what a Gateway writes and an app reads; a round
+    /// trip alone could not see a renamed key. The batch also carries an unknown event between
+    /// the known ones, which must not cost the chat events around it.
+    func testChatEventsDecodeFromLiteralJSONNextToAnUnknownOne() throws {
+        let id = UUID()
+        let transcript = Data("T".utf8)
+        let literal = """
+        {"version":3,"sequence":4,"events":[\
+        {"type":"chatDelta","requestID":"\(id.uuidString)","text":"Hel","usedTokens":7},\
+        {"type":"someFutureEvent"},\
+        {"type":"chatFinished","requestID":"\(id.uuidString)","transcript":"\(transcript.base64EncodedString())","usedTokens":9},\
+        {"type":"chatFailed","requestID":"\(id.uuidString)","failure":{"kind":"cancelled","message":"Stopped."}}]}
+        """
+        let batch = try GatewayWire.decoder.decode(GatewayEventBatch.self, from: Data(literal.utf8))
+        XCTAssertEqual(batch.events, [
+            .chatDelta(requestID: id, text: "Hel", usedTokens: 7),
+            .unknown(type: "someFutureEvent"),
+            .chatFinished(requestID: id, transcript: transcript, usedTokens: 9),
+            .chatFailed(requestID: id, failure: GatewayFailure(kind: .cancelled, message: "Stopped.")),
+        ])
+        // And back: what this build writes is what it reads.
+        let again = try GatewayWire.decoder.decode(
+            GatewayEventBatch.self, from: try GatewayWire.encoder.encode(batch)
+        )
+        XCTAssertEqual(again, batch)
+    }
+
+    /// A chat event that lacks a field is a broken peer, not a newer one: the batch is refused
+    /// whole, so the client reconnects instead of applying part of it.
+    func testAChatEventMissingAFieldFailsTheWholeBatch() {
+        let literal = """
+        {"version":3,"sequence":0,"events":[{"type":"chatDelta","requestID":"\(UUID().uuidString)","usedTokens":1}]}
+        """
+        XCTAssertThrowsError(
+            try GatewayWire.decoder.decode(GatewayEventBatch.self, from: Data(literal.utf8))
+        )
     }
 
     /// The memory bound per subscriber: 50 statuses queued while nothing is sent leave one
@@ -650,6 +688,71 @@ final class GatewayEventTests: XCTestCase {
         XCTAssertEqual(second?.sequence, 1)
         XCTAssertEqual(second?.events, [.status(makeStatus(zone: "NEXT"))])
         XCTAssertNil(queue.takeBatch())
+    }
+
+    /// The memory bound of the chat lane: a thousand deltas of one reply, queued while the app
+    /// sends nothing, leave one delta whose text is all of them in order and whose token count
+    /// is the last one. A queue that kept them one by one would hand out a thousand events.
+    func testConsecutiveDeltasOfOneReplyAreMergedIntoOne() {
+        let id = UUID()
+        var queue = GatewayEventQueue()
+        for index in 0..<1000 { queue.enqueue(chat: .chatDelta(requestID: id, text: "\(index),", usedTokens: index)) }
+        let batch = queue.takeBatch()
+        let expected = (0..<1000).map { "\($0)," }.joined()
+        XCTAssertEqual(batch?.events, [.chatDelta(requestID: id, text: expected, usedTokens: 999)])
+    }
+
+    /// Order is part of the contract: a `chatFinished` is a boundary, so the deltas before it
+    /// and the next reply's deltas are not merged across it, and nothing is reordered.
+    func testChatEventsKeepTheirOrderAndAreOnlyMergedWithinOneReply() {
+        let first = UUID(), second = UUID()
+        var queue = GatewayEventQueue()
+        queue.enqueue(chat: .chatDelta(requestID: first, text: "a", usedTokens: 1))
+        queue.enqueue(chat: .chatDelta(requestID: first, text: "b", usedTokens: 2))
+        queue.enqueue(chat: .chatFinished(requestID: first, transcript: Data("T".utf8), usedTokens: 2))
+        queue.enqueue(chat: .chatDelta(requestID: second, text: "c", usedTokens: 1))
+        queue.enqueue(chat: .chatDelta(requestID: first, text: "d", usedTokens: 3))
+        XCTAssertEqual(queue.takeBatch()?.events, [
+            .chatDelta(requestID: first, text: "ab", usedTokens: 2),
+            .chatFinished(requestID: first, transcript: Data("T".utf8), usedTokens: 2),
+            .chatDelta(requestID: second, text: "c", usedTokens: 1),
+            .chatDelta(requestID: first, text: "d", usedTokens: 3),
+        ])
+    }
+
+    /// Backpressure applies to the chat lane too: while a batch is unacknowledged nothing else is
+    /// handed out, and what arrived meanwhile goes out as one coalesced batch with the next
+    /// sequence number, so the app sees no gap.
+    func testChatEventsWaitForTheAckAndThenGoOutTogether() {
+        let id = UUID()
+        var queue = GatewayEventQueue()
+        queue.enqueue(chat: .chatDelta(requestID: id, text: "x", usedTokens: 1))
+        XCTAssertEqual(queue.takeBatch()?.sequence, 0)
+        for text in ["y", "z"] { queue.enqueue(chat: .chatDelta(requestID: id, text: text, usedTokens: 2)) }
+        XCTAssertNil(queue.takeBatch(), "no second batch before the first is acknowledged")
+        XCTAssertFalse(queue.isIdle)
+        queue.acknowledge()
+        let second = queue.takeBatch()
+        XCTAssertEqual(second?.sequence, 1)
+        XCTAssertEqual(second?.events, [.chatDelta(requestID: id, text: "yz", usedTokens: 2)])
+    }
+
+    /// Both lanes ride in one batch (one in flight, one sequence); the status is still just the
+    /// latest, and an event that is not a chat event is not accepted into the chat lane.
+    func testStatusAndChatShareOneBatchAndOnlyChatEventsEnterTheChatLane() {
+        let id = UUID()
+        var queue = GatewayEventQueue()
+        queue.enqueue(chat: .status(makeStatus(zone: "IGNORED")))
+        queue.enqueue(chat: .unknown(type: "x"))
+        XCTAssertTrue(queue.isIdle)
+
+        queue.enqueue(status: makeStatus(zone: "OLD"))
+        queue.enqueue(chat: .chatDelta(requestID: id, text: "hi", usedTokens: 1))
+        queue.enqueue(status: makeStatus(zone: "NEW"))
+        XCTAssertEqual(queue.takeBatch()?.events, [
+            .chatDelta(requestID: id, text: "hi", usedTokens: 1),
+            .status(makeStatus(zone: "NEW")),
+        ])
     }
 
     // MARK: Publisher
@@ -773,6 +876,45 @@ final class GatewayEventTests: XCTestCase {
         XCTAssertEqual(latest.config.hour, 19, "intermediate statuses are coalesced away")
         XCTAssertEqual(sink.batches.map(\.sequence), [0, 1])
         sink.acknowledge()
+    }
+
+    /// A reply's text belongs to the connection that asked for it. Two apps are subscribed; the
+    /// chat events sent to one must not appear in the other's batches, which carry status only.
+    func testChatEventsReachOnlyTheConnectionTheyAreAddressedTo() async throws {
+        let (publisher, _) = makePublisher()
+        let asker = FakeSink(.ackImmediately), bystander = FakeSink(.ackImmediately)
+        let askerID = UUID()
+        await publisher.subscribe(askerID, sink: asker)
+        await publisher.subscribe(UUID(), sink: bystander)
+        let id = UUID()
+
+        let accepted = await publisher.send(chat: .chatDelta(requestID: id, text: "hi", usedTokens: 1), to: askerID)
+        XCTAssertTrue(accepted)
+        try await pollUntil("the delta is delivered") { await publisher.isIdle }
+
+        let asked = asker.batches.flatMap(\.events).filter(\.isChat)
+        XCTAssertEqual(asked, [.chatDelta(requestID: id, text: "hi", usedTokens: 1)])
+        XCTAssertTrue(bystander.batches.flatMap(\.events).filter(\.isChat).isEmpty)
+    }
+
+    /// A connection that is gone (closed, or dropped for a missed ack) takes no more output, and
+    /// the sender is told so it can stop the generation instead of producing for nobody.
+    func testChatEventsForAConnectionThatIsNotSubscribedAreRefused() async throws {
+        let (publisher, _) = makePublisher()
+        let sink = FakeSink(.ackImmediately)
+        let id = UUID()
+        await publisher.subscribe(id, sink: sink)
+        try await pollUntil("subscribed and idle") { await publisher.isIdle }
+        let before = sink.batches.count
+
+        await publisher.unsubscribe(id)
+        let accepted = await publisher.send(chat: .chatDelta(requestID: UUID(), text: "x", usedTokens: 1), to: id)
+        XCTAssertFalse(accepted)
+        let unknown = await publisher.send(chat: .chatDelta(requestID: UUID(), text: "x", usedTokens: 1), to: UUID())
+        XCTAssertFalse(unknown)
+        XCTAssertEqual(sink.batches.count, before, "nothing was sent to a connection that left")
+        let idle = await publisher.isIdle
+        XCTAssertTrue(idle)
     }
 
     /// The single-flight rule. Without it, a publish suspended in its status read could

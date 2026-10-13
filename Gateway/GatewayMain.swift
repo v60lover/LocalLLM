@@ -54,28 +54,39 @@ final class GatewayListenerDelegate: NSObject, NSXPCListenerDelegate, @unchecked
     /// Shared by all connections, so the request ledger and the instance ID are per process.
     private let handler: GatewayRequestHandler
     private let publisher: GatewayEventPublisher
+    /// Told when a connection ends, so the generations it started stop.
+    private let chat: GatewayChatService
 
-    init(handler: GatewayRequestHandler, publisher: GatewayEventPublisher) {
+    init(handler: GatewayRequestHandler, publisher: GatewayEventPublisher, chat: GatewayChatService) {
         self.handler = handler
         self.publisher = publisher
+        self.chat = chat
     }
 
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
         // The publisher's key for this connection; used to subscribe it and to remove it.
         let id = UUID()
         let publisher = publisher
+        let chat = chat
         let sink = XPCGatewayEventSink(connection: connection)
         // Pushes start after a successful hello; until then the connection is not subscribed.
-        let context = GatewayConnectionContext(onGreeted: {
-            Task { await publisher.subscribe(id, sink: sink) }
+        let context = GatewayConnectionContext(id: id, onGreeted: {
+            await publisher.subscribe(id, sink: sink)
         })
         // Exported: what the app calls here. Remote: the sink the app exports for pushes.
         connection.exportedInterface = NSXPCInterface(with: GatewayXPCProtocol.self)
         connection.exportedObject = GatewayConnectionService(handler: handler, context: context)
         connection.remoteObjectInterface = NSXPCInterface(with: GatewayEventSinkXPC.self)
-        // A vanished app must not stay subscribed.
-        connection.invalidationHandler = { Task { await publisher.unsubscribe(id) } }
-        connection.interruptionHandler = { Task { await publisher.unsubscribe(id) } }
+        // A vanished app must not stay subscribed, and must not leave a model generating for
+        // it. Both handlers do the same: an interrupted connection is not resumed.
+        let closed: @Sendable () -> Void = {
+            Task {
+                await publisher.unsubscribe(id)
+                await chat.connectionClosed(id)
+            }
+        }
+        connection.invalidationHandler = closed
+        connection.interruptionHandler = closed
         connection.resume()
         return true
     }
@@ -117,9 +128,12 @@ struct GatewayMain {
         // From here on every engine change reaches the publisher. Nothing was missed before
         // this line: the scheduler loop has not started and no connection is accepted yet.
         relay.attach(publisher)
+        // Chat replies run on the same supervisor as the digest, so they share one resident
+        // model and queue behind each other; their output goes back through the publisher.
+        let chat = GatewayChatService(worker: supervisor, locator: ModelStoreLocator(), events: publisher)
         // One handler for the whole process (see `GatewayListenerDelegate`).
-        let handler = GatewayRequestHandler(engine: engine, workerStatus: workerStatus)
-        let delegate = GatewayListenerDelegate(handler: handler, publisher: publisher)
+        let handler = GatewayRequestHandler(engine: engine, workerStatus: workerStatus, chat: chat)
+        let delegate = GatewayListenerDelegate(handler: handler, publisher: publisher, chat: chat)
         let listener = NSXPCListener(machServiceName: GatewayConstants.machServiceName)
         listener.delegate = delegate
         listener.resume()

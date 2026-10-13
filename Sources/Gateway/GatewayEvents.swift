@@ -6,7 +6,8 @@ import OSLog
 // changes. The pieces, from the wire inwards:
 //   GatewayEventSinkXPC    the Objective-C method the app exports on its connection
 //   GatewayEvent / Batch   what travels through it
-//   GatewayEventQueue      pure per-subscriber queue: latest status only, one batch in flight
+//   GatewayEventQueue      pure per-subscriber queue: latest status plus an ordered chat lane,
+//                          one batch in flight
 //   GatewayEventPublisher  reads the status on every change and feeds each subscriber's queue
 // The request/reply direction lives in `GatewayIPC.swift`.
 
@@ -21,17 +22,57 @@ import OSLog
 /// older app skips (`.unknown`) instead of failing to decode the whole batch.
 enum GatewayEvent: Codable, Equatable, Sendable {
     case status(GatewayStatus)
+    /// Text appended to the reply of generation `requestID` since the previous delta (not the
+    /// reply so far). `usedTokens` is the count so far when the Gateway knows it, nil when it
+    /// does not (it always arrives with `chatFinished`). Only the connection that sent the
+    /// `chatGenerate` receives it.
+    case chatDelta(requestID: UUID, text: String, usedTokens: Int?)
+    /// The reply is complete. `transcript` is the encoded `Transcript` including this turn, to
+    /// send back with the next `chatGenerate`. Ends the generation.
+    case chatFinished(requestID: UUID, transcript: Data, usedTokens: Int)
+    /// The generation ended without a reply. `failure.kind == .cancelled` is a stop the caller
+    /// asked for, not an error. Ends the generation.
+    case chatFailed(requestID: UUID, failure: GatewayFailure)
     case unknown(type: String)
 
-    private enum CodingKeys: String, CodingKey { case type, status }
+    /// Part of the chat stream (as opposed to a status snapshot or an unknown event).
+    var isChat: Bool {
+        switch self {
+        case .chatDelta, .chatFinished, .chatFailed: true
+        case .status, .unknown: false
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type, status, requestID, text, usedTokens, transcript, failure
+    }
 
     // Hand-written on purpose: the synthesized decoder throws on a case it does not know, and
-    // one unknown event would then cost the app every event in the same batch.
+    // one unknown event would then cost the app every event in the same batch. A *known* type
+    // with a missing field still throws: that is a broken peer, and the whole batch is then
+    // reported as undecodable (the client reconnects) rather than half applied.
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let type = try container.decode(String.self, forKey: .type)
         switch type {
         case "status": self = .status(try container.decode(GatewayStatus.self, forKey: .status))
+        case "chatDelta":
+            self = .chatDelta(
+                requestID: try container.decode(UUID.self, forKey: .requestID),
+                text: try container.decode(String.self, forKey: .text),
+                usedTokens: try container.decodeIfPresent(Int.self, forKey: .usedTokens)
+            )
+        case "chatFinished":
+            self = .chatFinished(
+                requestID: try container.decode(UUID.self, forKey: .requestID),
+                transcript: try container.decode(Data.self, forKey: .transcript),
+                usedTokens: try container.decode(Int.self, forKey: .usedTokens)
+            )
+        case "chatFailed":
+            self = .chatFailed(
+                requestID: try container.decode(UUID.self, forKey: .requestID),
+                failure: try container.decode(GatewayFailure.self, forKey: .failure)
+            )
         default: self = .unknown(type: type)
         }
     }
@@ -42,6 +83,20 @@ enum GatewayEvent: Codable, Equatable, Sendable {
         case .status(let status):
             try container.encode("status", forKey: .type)
             try container.encode(status, forKey: .status)
+        case .chatDelta(let requestID, let text, let usedTokens):
+            try container.encode("chatDelta", forKey: .type)
+            try container.encode(requestID, forKey: .requestID)
+            try container.encode(text, forKey: .text)
+            try container.encodeIfPresent(usedTokens, forKey: .usedTokens)
+        case .chatFinished(let requestID, let transcript, let usedTokens):
+            try container.encode("chatFinished", forKey: .type)
+            try container.encode(requestID, forKey: .requestID)
+            try container.encode(transcript, forKey: .transcript)
+            try container.encode(usedTokens, forKey: .usedTokens)
+        case .chatFailed(let requestID, let failure):
+            try container.encode("chatFailed", forKey: .type)
+            try container.encode(requestID, forKey: .requestID)
+            try container.encode(failure, forKey: .failure)
         case .unknown(let type):
             // Only the type survives a round trip; the payload was never decoded.
             try container.encode(type, forKey: .type)
@@ -57,30 +112,63 @@ struct GatewayEventBatch: Codable, Equatable, Sendable {
     var events: [GatewayEvent]
 }
 
-/// Pure outbound queue for one subscriber. Status events are snapshots, so only the latest one
-/// is kept; together with a single batch in flight that bounds memory per subscriber at a
-/// constant, however fast the state changes. The transport calls `acknowledge()` on the ack.
+/// Pure outbound queue for one subscriber, with two lanes that share one batch in flight.
+///
+/// - **Status** events are snapshots, so only the latest one is kept.
+/// - **Chat** events are a stream and must all arrive, in order, because a lost delta cannot be
+///   rebuilt from a later one. Consecutive deltas of one generation are merged into one, so a
+///   slow app sees fewer, larger deltas rather than a longer queue.
+///
+/// Memory per subscriber is therefore bounded by one batch in flight plus the text one reply
+/// can produce (the worker caps a reply at its token limit), and a subscriber that does not
+/// acknowledge within the publisher's timeout is dropped. The transport calls `acknowledge()`
+/// on the ack.
 struct GatewayEventQueue: Sendable {
     /// The one status waiting to be sent; a newer one replaces it.
     private var pendingStatus: GatewayStatus?
+    /// Chat events waiting to be sent, oldest first.
+    private var pendingChat: [GatewayEvent] = []
     /// A batch was handed out and its ack has not come back yet.
     private var inFlight = false
     private var nextSequence = 0
 
-    var isIdle: Bool { pendingStatus == nil && !inFlight }
-    var hasPending: Bool { pendingStatus != nil }
+    var isIdle: Bool { !hasPending && !inFlight }
+    var hasPending: Bool { pendingStatus != nil || !pendingChat.isEmpty }
     var isInFlight: Bool { inFlight }
 
     /// Overwrites whatever was waiting: once a newer snapshot exists the older one is useless.
     mutating func enqueue(status: GatewayStatus) { pendingStatus = status }
 
+    /// Queues a chat event behind the ones already waiting. A delta directly after a delta of
+    /// the same generation is merged into it; any other event is a boundary and is kept as is
+    /// (a `chatFinished` must stay between the deltas before it and the next generation's).
+    /// Anything that is not a chat event is ignored: status goes through `enqueue(status:)`.
+    mutating func enqueue(chat event: GatewayEvent) {
+        guard event.isChat else { return }
+        if case .chatDelta(let id, let text, let used) = event,
+           case .chatDelta(let lastID, let lastText, _)? = pendingChat.last, lastID == id {
+            // The latest token count wins (an unknown one does not erase a known one); the
+            // text is the two appended.
+            let lastUsed: Int?
+            if case .chatDelta(_, _, let earlier) = pendingChat[pendingChat.count - 1] { lastUsed = earlier } else { lastUsed = nil }
+            pendingChat[pendingChat.count - 1] = .chatDelta(
+                requestID: id, text: lastText + text, usedTokens: used ?? lastUsed
+            )
+        } else {
+            pendingChat.append(event)
+        }
+    }
+
     /// The next batch to send, or nil when nothing is pending or the previous batch is unacked.
     mutating func takeBatch() -> GatewayEventBatch? {
-        guard !inFlight, let status = pendingStatus else { return nil }
+        guard !inFlight, hasPending else { return nil }
+        // Chat first, in order; the status snapshot rides along at the end.
+        var events = pendingChat
+        if let status = pendingStatus { events.append(.status(status)) }
         // The sequence only advances for a batch that is actually handed out, so the receiver
         // sees no gaps for statuses that were replaced while waiting.
-        defer { pendingStatus = nil; inFlight = true; nextSequence += 1 }
-        return GatewayEventBatch(sequence: nextSequence, events: [.status(status)])
+        defer { pendingStatus = nil; pendingChat = []; inFlight = true; nextSequence += 1 }
+        return GatewayEventBatch(sequence: nextSequence, events: events)
     }
 
     /// The app confirmed the batch in flight; the next one may go.
@@ -176,6 +264,17 @@ actor GatewayEventPublisher: GatewayChangeObserver {
     /// The connection is gone. A pump still running for it notices on its next step and stops.
     func unsubscribe(_ id: UUID) {
         subscribers[id] = nil
+    }
+
+    /// Queues a chat event for the one connection `id` that asked for the generation; other
+    /// subscribers never see it. Returns false, and queues nothing, when that connection is not
+    /// subscribed any more (it closed, or was dropped for a missed ack): the caller then stops
+    /// producing output nobody can receive.
+    func send(chat event: GatewayEvent, to id: UUID) -> Bool {
+        guard subscribers[id] != nil else { return false }
+        subscribers[id]?.queue.enqueue(chat: event)
+        pump(id)
+        return true
     }
 
     // Nonisolated so the engine can call it synchronously from inside its own actor; the

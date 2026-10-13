@@ -1,7 +1,7 @@
 #if os(macOS)
 import Foundation
 
-/// Versioned app <-> Gateway contract (protocol 2). One XPC method carries a JSON envelope so the
+/// Versioned app <-> Gateway contract (protocol 3). One XPC method carries a JSON envelope so the
 /// wire format can evolve without changing the Objective-C protocol. Pushed output flows the other
 /// way through a client-exported `GatewayEventSinkXPC` (see `GatewayEvents.swift`).
 ///
@@ -15,6 +15,23 @@ import Foundation
 ///   ones keep their shape.
 @objc protocol GatewayXPCProtocol {
     func send(_ request: Data, reply: @escaping @Sendable (Data) -> Void)
+}
+
+/// One chat reply to generate, as the app sends it. The Gateway resolves `model` to a bundle on
+/// disk itself and the worker keeps no conversation between replies, so everything the model
+/// needs to continue the conversation travels in the request.
+struct ChatGenerateRequest: Codable, Equatable, Sendable {
+    /// Which downloaded model answers; a model that is not on disk is refused with
+    /// `GatewayFailureKind.modelNotDownloaded`.
+    var model: ModelReference
+    var prompt: String
+    /// System instructions for a conversation that has no transcript yet. Ignored when
+    /// `transcript` is set: the transcript already holds them.
+    var instructions: String?
+    /// An encoded `Transcript` the reply continues from; nil starts a new conversation.
+    var transcript: Data?
+    /// Upper bound on the reply's tokens; nil leaves it to the model's default.
+    var maximumResponseTokens: Int?
 }
 
 enum GatewayRequest: Codable, Equatable, Sendable {
@@ -32,11 +49,20 @@ enum GatewayRequest: Codable, Equatable, Sendable {
     case ping
     /// What became of an earlier request, by its `requestID`.
     case requestStatus(UUID)
+    /// Starts one chat reply. Answered with `accepted` as soon as it is queued, not when it is
+    /// finished: the request ID of this envelope names the generation, and its output arrives
+    /// as chat events tagged with that ID (a request/reply pair cannot carry it, since requests
+    /// time out long before a reply is done).
+    case chatGenerate(ChatGenerateRequest)
+    /// Stops the generation started by the request whose ID is `target`. Answered with
+    /// `accepted` whether or not it was still running; a stopped generation ends with a
+    /// `cancelled` chat failure event, which is not an error.
+    case chatCancel(target: UUID)
 
     /// Whether the request changes Gateway state and therefore goes through the ledger.
     var isMutating: Bool {
         switch self {
-        case .updateConfig, .runNow, .cancelRun: true
+        case .updateConfig, .runNow, .cancelRun, .chatGenerate, .chatCancel: true
         case .hello, .status, .ping, .requestStatus: false
         }
     }
@@ -47,6 +73,10 @@ enum GatewayRequest: Codable, Equatable, Sendable {
 enum GatewayFailureKind: String, Codable, Sendable {
     case unsupportedProtocol, handshakeRequired, malformedRequest
     case alreadyRunning, invalidConfig, requestInProgress, internalError
+    // Chat. Each one is something the app acts on differently, so none is folded into
+    // `internalError`: overflow trims and retries, a missing download offers the download,
+    // `cancelled` is silent, pressure and an unavailable worker are shown as temporary.
+    case contextOverflow, modelNotDownloaded, cancelled, memoryPressure, workerUnavailable
 }
 
 /// A refusal: `kind` for the code, `message` for the user.
@@ -73,6 +103,9 @@ indirect enum GatewayReply: Codable, Equatable, Sendable {
     case status(GatewayStatus)
     case pong
     case requestState(GatewayRequestState)
+    /// The request was taken and its work continues (a chat generation); the outcome follows
+    /// as events, not as a reply.
+    case accepted
     case failure(GatewayFailure)
 }
 
@@ -175,23 +208,31 @@ struct GatewayStatusSource: Sendable {
 // Safe: `greeted` is only accessed under `lock`; `onGreeted` is an immutable `let` and runs after unlock.
 final class GatewayConnectionContext: @unchecked Sendable {
     private let lock = NSLock()
+    /// Names this connection to the transport's other parts: the event publisher keys its
+    /// subscriber by it, and a chat generation is owned by it.
+    let id: UUID
     /// A hello with the right version was answered on this connection.
     private var greeted = false
-    private let onGreeted: (@Sendable () -> Void)?
+    private let onGreeted: (@Sendable () async -> Void)?
 
-    /// `onGreeted` runs once, after a successful `hello` (the transport subscribes to pushes there).
-    init(onGreeted: (@Sendable () -> Void)? = nil) { self.onGreeted = onGreeted }
+    /// `onGreeted` runs once, after a successful `hello` (the transport subscribes to pushes
+    /// there). The handler waits for it before answering the hello, so a request the client
+    /// sends after the reply always finds the connection subscribed.
+    init(id: UUID = UUID(), onGreeted: (@Sendable () async -> Void)? = nil) {
+        self.id = id
+        self.onGreeted = onGreeted
+    }
 
     var hasGreeted: Bool { lock.withLock { greeted } }
 
-    fileprivate func markGreeted() {
+    fileprivate func markGreeted() async {
         // A client may send hello twice; only the first one subscribes the connection.
         let first = lock.withLock { () -> Bool in
             let first = !greeted
             greeted = true
             return first
         }
-        if first { onGreeted?() }
+        if first { await onGreeted?() }
     }
 }
 
@@ -206,15 +247,21 @@ struct GatewayRequestHandler: Sendable {
     /// Identifies this Gateway process; a client that sees it change knows the ledger is gone.
     var instanceID = UUID()
     var ledger = GatewayRequestLedger()
+    /// Runs chat generations. Nil on a handler that serves no chat (the digest-only tests):
+    /// chat requests are then refused with a typed failure. Created once per process by the
+    /// composition root, like the engine.
+    var chat: GatewayChatService?
 
     init(
         engine: GatewayEngine, workerStatus: (@Sendable () async -> WorkerStatus?)? = nil,
-        instanceID: UUID = UUID(), ledger: GatewayRequestLedger = GatewayRequestLedger()
+        instanceID: UUID = UUID(), ledger: GatewayRequestLedger = GatewayRequestLedger(),
+        chat: GatewayChatService? = nil
     ) {
         self.engine = engine
         self.workerStatus = workerStatus
         self.instanceID = instanceID
         self.ledger = ledger
+        self.chat = chat
     }
 
     private var statusSource: GatewayStatusSource {
@@ -249,7 +296,7 @@ struct GatewayRequestHandler: Sendable {
             // The envelope version matched above, but the version the peer states in the hello
             // itself is checked too: only a matching one marks the connection as greeted.
             guard version == GatewayConstants.protocolVersion else { return mismatchReply(peerVersion: version) }
-            connection.markGreeted()
+            await connection.markGreeted()
             return encode(.hello(version: GatewayConstants.protocolVersion, instanceID: instanceID), id: id)
         }
         // Refused before the ledger or the engine is touched: a peer that skipped the
@@ -270,8 +317,10 @@ struct GatewayRequestHandler: Sendable {
             return encode(.status(await statusSource.current()), id: id)
         case .requestStatus(let target):
             return encode(.requestState(await ledger.state(of: target)), id: id)
-        case .updateConfig, .runNow, .cancelRun:
+        case .updateConfig, .runNow, .cancelRun, .chatGenerate, .chatCancel:
             // Mutating requests go through the ledger: at most one execution per request ID.
+            // For `chatGenerate` that is what keeps a retried request from starting a second
+            // generation.
             switch await ledger.begin(id) {
             case .duplicate(.completed(let stored)):
                 // Already done: the same answer again, without doing it again.
@@ -285,15 +334,35 @@ struct GatewayRequestHandler: Sendable {
             case .fresh:
                 // The reply is stored whether it is a success or a refusal, so a duplicate of
                 // a refused request is refused the same way.
-                let reply = await execute(envelope.request)
+                let reply = await execute(envelope.request, id: id, connection: connection)
                 await ledger.complete(id, with: reply)
                 return encode(reply, id: id)
             }
         }
     }
 
-    /// Runs one mutating request against the engine and turns the outcome into a reply.
-    private func execute(_ request: GatewayRequest) async -> GatewayReply {
+    /// Runs one mutating request and turns the outcome into a reply. `id` is the request's own
+    /// ID, which names a chat generation; `connection` owns it.
+    private func execute(
+        _ request: GatewayRequest, id: UUID, connection: GatewayConnectionContext
+    ) async -> GatewayReply {
+        switch request {
+        case .chatGenerate(let generate):
+            guard let chat else {
+                return .failure(.init(kind: .internalError, message: "Chat is not available on this Gateway."))
+            }
+            // Answered as soon as the generation is running (or refused); the output is events.
+            if let refusal = await chat.start(generate, id: id, connection: connection.id) {
+                return .failure(refusal)
+            }
+            return .accepted
+        case .chatCancel(let target):
+            // Not a failure when there is nothing to cancel: the generation may have just ended.
+            await chat?.cancel(target, connection: connection.id)
+            return .accepted
+        default:
+            break
+        }
         do {
             switch request {
             case .updateConfig(let config): try await engine.updateConfig(config)
@@ -373,5 +442,39 @@ enum GatewayClientEvent: Equatable, Sendable {
     /// The connection is down. `reason` is a full sentence fit to show to the user. Sent once
     /// per outage, not once per failed reconnect attempt.
     case disconnected(reason: String)
+}
+
+/// One step of a chat reply as the app sees it. Unlike status snapshots these cannot be
+/// replaced by a newer one, so they travel on their own stream that never drops.
+enum GatewayChatSignal: Equatable, Sendable {
+    /// Text appended to the reply of generation `requestID`; `usedTokens` is nil when unknown.
+    case delta(requestID: UUID, text: String, usedTokens: Int?)
+    /// The reply is complete; `transcript` is the encoded conversation including it.
+    case finished(requestID: UUID, transcript: Data, usedTokens: Int)
+    /// The generation ended without a reply; `.cancelled` is a requested stop.
+    case failed(requestID: UUID, failure: GatewayFailure)
+    /// The connection went away or lost output. Every generation in flight is over: its
+    /// remaining deltas cannot be repaired, and the Gateway cancels what it was running.
+    case connectionLost
+}
+
+/// How the app starts and stops chat replies through the Gateway. `GatewayClient` is the
+/// production conformance; kept apart from `GatewayControlling` so the settings window's
+/// fakes do not have to know about chat.
+protocol GatewayChatControlling: Sendable {
+    /// Starts generation `id`. Returns nil once the Gateway accepted it (output follows on
+    /// `chatSignals`) or the typed refusal. Throws `GatewayError` when the Gateway cannot be
+    /// reached or the outcome is unknown (`connectionLost`).
+    func generate(_ request: ChatGenerateRequest, id: UUID) async throws -> GatewayFailure?
+    /// Asks the Gateway to stop generation `id`. A stop is acknowledged whether or not it was
+    /// still running; the generation then ends with `failed(.cancelled)`.
+    func cancel(_ id: UUID) async throws
+    /// Connects and greets now, so "the Gateway is not installed" shows before any work is
+    /// started. Throws `GatewayError`.
+    func connect() async throws
+    /// Chat output, for a single consumer. Finishes when the client is stopped.
+    var chatSignals: AsyncStream<GatewayChatSignal> { get }
+    func start() async
+    func stop() async
 }
 #endif

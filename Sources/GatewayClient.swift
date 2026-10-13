@@ -72,10 +72,14 @@ struct GatewayClientPolicy: Sendable {
 ///   with the reply, the request timeout or `stop()`, whichever comes first.
 /// - The connection does not keep the client alive (`EventRelay` and the maintain loop hold it
 ///   weakly); a client that is released without `stop()` closes its connection.
-actor GatewayClient: GatewayControlling {
+actor GatewayClient: GatewayControlling, GatewayChatControlling {
     nonisolated let events: AsyncStream<GatewayClientEvent>
     /// The writing end of `events`; finished in `stop()`.
     private let continuation: AsyncStream<GatewayClientEvent>.Continuation
+    /// Chat output. Unbounded on purpose: a delta is not a snapshot, so dropping one corrupts
+    /// the reply. Bounded in practice by what one reply can produce; finished in `stop()`.
+    nonisolated let chatSignals: AsyncStream<GatewayChatSignal>
+    private let chatContinuation: AsyncStream<GatewayChatSignal>.Continuation
 
     private let connector: any GatewayConnecting
     private let clock: any SupervisorClock
@@ -113,6 +117,9 @@ actor GatewayClient: GatewayControlling {
         let stream = AsyncStream.makeStream(of: GatewayClientEvent.self, bufferingPolicy: .bufferingNewest(32))
         events = stream.stream
         continuation = stream.continuation
+        let chat = AsyncStream.makeStream(of: GatewayChatSignal.self, bufferingPolicy: .unbounded)
+        chatSignals = chat.stream
+        chatContinuation = chat.continuation
     }
 
     var isConnected: Bool { link != nil }
@@ -128,6 +135,26 @@ actor GatewayClient: GatewayControlling {
         case .status(let status): return status
         case .failure(let failure): throw Self.error(for: failure)
         // `hello`, `pong` and `requestState` are answers to requests this method never sends.
+        default: throw GatewayError.remote("Unexpected reply from the Gateway.")
+        }
+    }
+
+    // MARK: GatewayChatControlling
+
+    func generate(_ request: ChatGenerateRequest, id: UUID) async throws -> GatewayFailure? {
+        switch try await perform(.chatGenerate(request), id: id) {
+        case .accepted: return nil
+        case .failure(let failure): return failure
+        default: throw GatewayError.remote("Unexpected reply from the Gateway.")
+        }
+    }
+
+    func connect() async throws { _ = try await ensureConnected() }
+
+    func cancel(_ id: UUID) async throws {
+        switch try await perform(.chatCancel(target: id)) {
+        case .accepted: return
+        case .failure(let failure): throw Self.error(for: failure)
         default: throw GatewayError.remote("Unexpected reply from the Gateway.")
         }
     }
@@ -156,18 +183,19 @@ actor GatewayClient: GatewayControlling {
         drop(reason: "stopped", report: false)
         // Ends the consumer's `for await` loop; nothing is yielded after this.
         continuation.finish()
+        chatContinuation.finish()
     }
 
     // MARK: Requests
 
     /// One request from the caller's point of view: connect, exchange, and for a mutating
     /// request whose reply was lost, find out what happened instead of sending it again.
-    private func perform(_ request: GatewayRequest) async throws -> GatewayReply {
+    private func perform(_ request: GatewayRequest, id: UUID = UUID()) async throws -> GatewayReply {
         // Checked before anything is sent. Once the request is on the wire, cancelling the
         // caller no longer interrupts it; see the type docstring.
         try Task.checkCancellation()
-        // The ID is fixed before the first attempt: recovery asks about this same ID.
-        let id = UUID()
+        // `id` is fixed before the first attempt: recovery asks about this same ID. A chat
+        // generation supplies its own, because the ID is also what its events carry.
         let connectedEpoch = try await ensureConnected()
         // Remembered before sending, to tell a reconnect to the same Gateway process from a
         // reconnect to a restarted one.
@@ -332,6 +360,9 @@ actor GatewayClient: GatewayControlling {
         let old = link
         link = nil
         old?.invalidate()
+        // Whatever was generating on the old connection is cancelled by the Gateway and its
+        // remaining output is gone, so the chat consumer must not wait for it.
+        if old != nil { chatContinuation.yield(.connectionLost) }
         // Reported only when a working connection was actually lost, and only once per outage.
         if report, old != nil, !reportedDown {
             reportedDown = true
@@ -353,7 +384,18 @@ actor GatewayClient: GatewayControlling {
         lastSequence = batch.sequence
         for event in batch.events {
             // `.unknown` events come from a newer Gateway and are skipped.
-            if case .status(let status) = event { continuation.yield(.status(status)) }
+            switch event {
+            case .status(let status):
+                continuation.yield(.status(status))
+            case .chatDelta(let id, let text, let usedTokens):
+                chatContinuation.yield(.delta(requestID: id, text: text, usedTokens: usedTokens))
+            case .chatFinished(let id, let transcript, let usedTokens):
+                chatContinuation.yield(.finished(requestID: id, transcript: transcript, usedTokens: usedTokens))
+            case .chatFailed(let id, let failure):
+                chatContinuation.yield(.failed(requestID: id, failure: failure))
+            case .unknown:
+                break
+            }
         }
     }
 

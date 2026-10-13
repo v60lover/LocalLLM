@@ -89,6 +89,23 @@ final class GatewayIPCTests: XCTestCase {
         XCTAssertEqual(greetings.count, 1, "subscription must happen once per connection")
     }
 
+    /// The hello reply is only sent once the transport has finished subscribing the connection,
+    /// so a chat request that follows it can never find its connection unsubscribed. The hook
+    /// is slow (a real subscription is an actor hop plus a send): a handler that did not wait
+    /// would answer long before it records completion. The delay only makes the hook slow; a
+    /// correct handler does not depend on it.
+    func testTheHelloReplyWaitsForTheGreetedHookToFinish() async throws {
+        let (handler, _) = makeHandler()
+        let finished = GreetingCounter()
+        let connection = GatewayConnectionContext(onGreeted: {
+            try? await Task.sleep(for: .milliseconds(100))
+            finished.increment()
+        })
+        let reply = try await call(handler, .hello(version: GatewayConstants.protocolVersion), on: connection)
+        guard case .hello = reply else { return XCTFail("expected hello, got \(reply)") }
+        XCTAssertEqual(finished.count, 1, "the hook had not finished when the reply was produced")
+    }
+
     /// Without a handshake no request is served, and the refused ones leave no trace in the
     /// engine: no run, no config change.
     func testRequestsBeforeHelloAreRefusedAndChangeNothing() async throws {
@@ -116,6 +133,50 @@ final class GatewayIPCTests: XCTestCase {
         guard case .failure(let failure) = try await call(handler, .hello(version: 99), on: connection) else { return XCTFail() }
         XCTAssertEqual(failure.kind, .unsupportedProtocol)
         XCTAssertFalse(connection.hasGreeted)
+    }
+
+    /// Skew introduced by the chat requests: an app that still speaks protocol 2 must be told to
+    /// reinstall rather than be served requests it cannot follow, and its hello must not
+    /// subscribe the connection to pushes it would misread.
+    func testAProtocolTwoPeerIsRefusedWithATypedFailureAndNotGreeted() async throws {
+        let (handler, _) = makeHandler()
+        let connection = GatewayConnectionContext()
+        guard case .failure(let failure) = try await call(
+            handler, .hello(version: 2), version: 2, on: connection
+        ) else { return XCTFail("expected a failure it can show") }
+        XCTAssertEqual(failure.kind, .unsupportedProtocol)
+        XCTAssertEqual(failure.message, GatewayError.unsupportedProtocol(2).localizedDescription)
+        XCTAssertFalse(connection.hasGreeted)
+    }
+
+    /// The chat requests' bytes. A literal for the shape a client writes with every optional
+    /// field absent (a new conversation), because a round trip of the same types cannot see a
+    /// field that became required. Also pins that both requests are mutating.
+    func testChatRequestsDecodeFromLiteralJSONAndAreMutating() throws {
+        let id = UUID()
+        let generate = """
+        {"version":3,"requestID":"\(id.uuidString)","request":{"chatGenerate":{"_0":{\
+        "model":{"catalogID":"qwen3-0.6b","repo":"r","revision":"main"},"prompt":"hi"}}}}
+        """
+        let envelope = try GatewayWire.decoder.decode(GatewayRequestEnvelope.self, from: Data(generate.utf8))
+        XCTAssertEqual(envelope.requestID, id)
+        guard case .chatGenerate(let request) = envelope.request else { return XCTFail("wrong case") }
+        XCTAssertEqual(request.prompt, "hi")
+        XCTAssertEqual(request.model.catalogID, "qwen3-0.6b")
+        XCTAssertNil(request.instructions)
+        XCTAssertNil(request.transcript)
+        XCTAssertNil(request.maximumResponseTokens)
+
+        let target = UUID()
+        let cancel = """
+        {"version":3,"requestID":"\(UUID().uuidString)","request":{"chatCancel":{"target":"\(target.uuidString)"}}}
+        """
+        let cancelEnvelope = try GatewayWire.decoder.decode(GatewayRequestEnvelope.self, from: Data(cancel.utf8))
+        XCTAssertEqual(cancelEnvelope.request, .chatCancel(target: target))
+
+        // Both change Gateway state, so both go through the at-most-once ledger.
+        XCTAssertTrue(envelope.request.isMutating)
+        XCTAssertTrue(cancelEnvelope.request.isMutating)
     }
 
     /// Whatever arrives, the peer gets a typed failure it can decode, never silence.

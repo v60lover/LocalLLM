@@ -111,10 +111,20 @@ final class ChatStore {
 
     init(
         repository: ConversationRepository = ConversationRepository(),
-        backend: any ChatBackend = CoreAIBackend()
+        backend: any ChatBackend = ChatStore.defaultBackend()
     ) {
         self.repository = repository
         self.backend = backend
+    }
+
+    /// macOS chats through the Gateway so the model lives outside the app process; iOS has no
+    /// Gateway and runs the model in-process.
+    static func defaultBackend() -> any ChatBackend {
+        #if os(macOS)
+        XPCChatBackend()
+        #else
+        CoreAIBackend()
+        #endif
     }
 
     var isGenerating: Bool { generation == .generating }

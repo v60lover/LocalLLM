@@ -3,9 +3,11 @@ import Foundation
 
 enum GatewayConstants {
     /// App <-> Gateway wire version. 2 added the hello handshake, request IDs with the
-    /// at-most-once ledger, typed failures and pushed events. Bump it for any change an older
-    /// peer cannot decode; an additive optional field (like `GatewayStatus.revision`) needs none.
-    static let protocolVersion = 2
+    /// at-most-once ledger, typed failures and pushed events. 3 added chat generation
+    /// (`chatGenerate`, `chatCancel`, the `accepted` reply and the chat failure kinds). Bump it
+    /// for any change an older peer cannot decode; an additive optional field (like
+    /// `GatewayStatus.revision`) needs none.
+    static let protocolVersion = 3
     static let label = "com.example.localllmchat.gateway"
     static let machServiceName = label
     static let executableName = "LocalLLMGateway"

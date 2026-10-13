@@ -23,9 +23,14 @@ struct GenerationOutcome {
 
 enum ChatRuntimeError: LocalizedError, Equatable {
     case contextOverflow
+    /// The model service went away mid-reply. Nothing of the reply is kept; sending again
+    /// reconnects.
+    case interrupted
 
     var errorDescription: String? {
         switch self {
+        case .interrupted:
+            "The reply was interrupted because the connection to the Gateway was lost. Send your message again."
         case .contextOverflow:
             "The conversation no longer fits in the model's context window. Start a new chat."
         }
@@ -144,3 +149,22 @@ private struct CoreAIModelHandle: ChatModelHandle {
         AgentRuntime(model: model, transcript: transcript, executor: executor, report: report)
     }
 }
+
+#if os(macOS)
+extension CoreAIBackend {
+    /// Makes sure the model is on disk and says where the Gateway finds it, without loading it
+    /// into this process: the Gateway's worker is the one that loads and runs it.
+    func downloadedModel(
+        for option: ChatModelOption, progress: @escaping @Sendable (Double) -> Void
+    ) async throws -> (reference: ModelReference, contextSize: Int?) {
+        guard let modelID = entries[option.id]?.modelID else {
+            throw ChatBackendError.modelUnavailable(option.name)
+        }
+        let url = try await ModelStore.default.download(modelID) { progress($0.fraction) }
+        let reference = ModelReference(
+            catalogID: option.id, repo: modelID.repo, path: modelID.path, revision: modelID.revision
+        )
+        return (reference, Self.readContextSize(from: url))
+    }
+}
+#endif
