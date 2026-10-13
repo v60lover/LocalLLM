@@ -28,6 +28,34 @@ func run(
     print("  state = \(await supervisor.state)")
 }
 
+struct FixedLocator: ModelLocating {
+    let path: String
+    func localPath(for model: ModelReference) -> String? { path }
+}
+
+/// The Gateway's real digest path: one verdict job per item, then the digest job.
+func digest() async {
+    let titles = [
+        "Rescuers free all 12 miners trapped underground for three days",
+        "Earthquake kills dozens and destroys hundreds of homes",
+        "New malaria vaccine cuts child deaths by half in trial",
+        "Bank fraud scandal wipes out pensioners' savings",
+    ]
+    let items = titles.enumerated().map { index, title in
+        NewsItem(title: title, summary: "", link: "https://example.com/\(index)", source: "example.com", published: nil)
+    }
+    let started = Date()
+    do {
+        let summary = try await WorkerDigestSummarizer(worker: supervisor, locator: FixedLocator(path: model))
+            .summarize(items: items, model: ModelReference(catalogID: "harness", repo: "", path: nil, revision: ""))
+        print("digest: OK in \(String(format: "%.1f", Date().timeIntervalSince(started)))s, good = \(summary.items.map(\.title))")
+        print("  text: \(summary.text)")
+    } catch {
+        print("digest: FAILED \(error)")
+    }
+    print("  state = \(await supervisor.state)")
+}
+
 Task {
     await run("cold", "What is the capital of France? /no_think")
     await run("warm", "What is 2+2? /no_think")
@@ -42,6 +70,7 @@ Task {
     // No pause between the kill and the reconnect: the new connection must get a fresh worker.
     await supervisor.unloadNow()
     await run("after-unload", "Name a fruit. /no_think")
+    await digest()
     exit(0)
 }
 dispatchMain()

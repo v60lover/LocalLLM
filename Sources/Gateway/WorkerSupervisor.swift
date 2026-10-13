@@ -81,6 +81,19 @@ enum WorkerSupervisorState: Equatable, Sendable {
     case safeMode
 }
 
+extension WorkerStatus {
+    init(_ state: WorkerSupervisorState) {
+        self.state = switch state {
+        case .idle: "idle"
+        case .starting: "starting"
+        case .ready: "ready"
+        case .restarting: "restarting"
+        case .safeMode: "safeMode"
+        }
+        isSafeMode = state == .safeMode
+    }
+}
+
 enum WorkerSupervisorError: Error, Equatable, Sendable {
     enum Reason: Equatable, Sendable { case crashed, unresponsive }
     case interrupted(Reason, deliveredOutput: Bool)

@@ -41,6 +41,7 @@ Log: unified logging, subsystem `com.example.localllmchat.gateway` (`log stream 
 - **Errors.** After a failure (no network, model not downloaded, no Pages access) the attempt is retried after 10 minutes, at most 3 times a day. Changing the settings resets the counter. The reason for the last error is shown in the settings.
 - **Restart.** If the Gateway exits during a run, that attempt is marked as interrupted on startup and retried immediately.
 - **Timeout and cancel.** A run is limited to 15 minutes; "Cancel" stops it and terminates the automation process. Each feed: 20 s timeout, at most 2 MB; up to 8 items per source and 24 overall.
+- **Model residency.** The model lives in the worker process, not in the Gateway. It is loaded on the first verdict of a run and stays warm for 10 minutes after the last job (a "Run Now" within that time reuses it; a retry comes later and loads it again), then the worker is unloaded and killed. Critical memory pressure fails a running digest instead of finishing it; the attempt is then retried like any other failure. A worker crash is retried once on a fresh worker; a second crash on the same step fails the run, which is then retried like any other failure, so a worker that keeps crashing costs at most the day's 3 attempts. Three crashes in a row stop the worker (safe mode) until the next run, which starts with a clean counter.
 - **Login session.** The agent loads only in a graphical session (`LimitLoadToSessionType = Aqua`): the Pages window has to open on the desktop.
 - **Signing.** For the Automation permission to stick, the Gateway must be signed by the same team as the app; press "Reinstall" after every rebuild.
 
@@ -52,18 +53,23 @@ Log: unified logging, subsystem `com.example.localllmchat.gateway` (`log stream 
 - **`LocalLLMGateway`**: a helper app embedded in the app (`Contents/Library/LoginItems/LocalLLMGateway.app`, `LSUIElement`). It must be an app bundle, not a bare executable, because the inference worker (`LocalLLMWorker.xpc` in its `Contents/XPCServices`) can only be looked up from inside a bundle.
   - launchd starts it as the per-user agent `com.example.localllmchat.gateway` (`RunAtLoad`, `KeepAlive`, graphical session only).
   - It runs independently of the chat window.
+  - It owns the worker's lifecycle (`WorkerSupervisor`): start, keep warm, unload when idle or on memory pressure, restart its timers after wake, restart after a crash.
   - `GatewayInstaller` installs and removes it via `SMAppService.agent`; the launchd plist ships in `Contents/Library/LaunchAgents` and points at the helper with `BundleProgram`. A plist written by older builds into `~/Library/LaunchAgents` is removed on install.
+
+- **Worker (`LocalLLMWorker.xpc`)**: an XPC service inside the Gateway bundle. It loads a model from a local path and runs generations. It has no network, no schedule and no state of its own; it exits when the Gateway's connection ends.
 
 #### IPC
 
 The app and the Gateway talk over XPC (mach service `com.example.localllmchat.gateway`). A single method, `send(Data, reply:)`, carries a JSON envelope with a protocol `version` (currently 1), so the wire format can evolve without changing the Objective-C protocol.
 
-Requests: `status`, `updateConfig`, `runNow`, `cancelRun`. Every reply is either the current `GatewayStatus` or an error message. `runNow` returns immediately; the app polls the status every 2 seconds to follow progress.
+Requests: `status`, `updateConfig`, `runNow`, `cancelRun`. Every reply is either the current `GatewayStatus` or an error message. `runNow` returns immediately; the app polls the status every 2 seconds to follow progress. `GatewayStatus.worker` carries the worker's state (`idle`, `starting`, `ready`, `restarting`, `safeMode`); it is optional, so builds on either side that do not know it still talk to each other.
+
+The Gateway and the worker use a second, separately versioned contract (`WorkerIPC.swift`, protocol version 1): one `send(Data, reply:)` method for requests, and a client-exported event sink through which the worker streams output in coalesced batches, one batch in flight until acknowledged.
 
 #### Layers inside the Gateway
 
 ```
-GatewayMain                      XPC listener + scheduler loop
+GatewayMain                      XPC listener + scheduler loop + main run loop (wake)
  └─ GatewayRequestHandler        decodes the envelope, checks the protocol version
      └─ GatewayEngine (actor)    schedule, state, exactly one active run
          ├─ DigestSchedule       pure policy: when is a run due?
@@ -71,7 +77,8 @@ GatewayMain                      XPC listener + scheduler loop
          └─ GatewayJob           protocol; the extension point for new job types
              └─ NewsDigestJob    news -> model -> document
                  ├─ NewsFetching         URLSession + RSS/Atom parsing
-                 ├─ DigestSummarizing    local CoreAIKit model
+                 ├─ DigestSummarizing    WorkerDigestSummarizer: prompts and verdicts here,
+                 │                       generation through WorkerSupervisor -> LocalLLMWorker.xpc
                  └─ DocumentPublishing   Pages via osascript
 ```
 
@@ -89,12 +96,12 @@ GatewayMain                      XPC listener + scheduler loop
 
 #### What is injectable in tests
 
-The clock (`GatewayClock`), news fetching, summarization, document publishing and launchd command execution all sit behind protocols. Scheduling, restart, deduplication and retries can therefore be tested deterministically, without a network, a model or Pages.
+The clock (`GatewayClock`), news fetching, summarization (the worker behind `DigestWorkerRunning`, the model cache behind `ModelLocating`), document publishing and launchd command execution all sit behind protocols. Scheduling, restart, deduplication and retries can therefore be tested deterministically, without a network, a model or Pages.
 
 #### Limitations
 
 - The Gateway runs in the user session, not as a system daemon, because the Pages window has to open on the desktop. Nothing runs while you are logged out.
 - The Automation permission for Pages is tied to the Gateway's code signature. If the signature changes, the permission has to be granted again.
-- The XPC listener does not verify the client's code signature. The service is only reachable inside the user's own launchd domain; add a code-signing requirement if stricter checking is needed.
+- Neither XPC peer is authenticated: the Gateway's listener does not verify the app's code signature, and the worker does not verify the Gateway's. The service is only reachable inside the user's own launchd domain; add a code-signing requirement if stricter checking is needed.
 
 Verification: `xcodebuild test` covers scheduling (including time zones and daylight saving), restart and deduplication, retries, timeout, cancellation, RSS/Atom feeds with a mocked network, the pipeline with mocked model and Pages, IPC and the installer. An opt-in end-to-end test (`TEST_RUNNER_GATEWAY_LIVE_SMOKE=1`) drives the real launchd agent, cached model and Pages.

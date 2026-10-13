@@ -47,6 +47,8 @@ enum GatewayWire {
 /// Transport-independent request handling, shared by the XPC service and by tests.
 struct GatewayRequestHandler: Sendable {
     let engine: GatewayEngine
+    /// Supplies the worker's state for the status reply; the engine does not know the worker.
+    var workerStatus: (@Sendable () async -> WorkerStatus?)?
 
     func handle(_ data: Data) async -> Data {
         let reply: GatewayReply
@@ -61,7 +63,9 @@ struct GatewayRequestHandler: Sendable {
             case .runNow: try await engine.startRun(.manual)
             case .cancelRun: await engine.cancelRun()
             }
-            reply = .status(await engine.status())
+            var status = await engine.status()
+            status.worker = await workerStatus?()
+            reply = .status(status)
         } catch let error as DecodingError {
             reply = .failure("Could not parse the Gateway request: \(error.localizedDescription)")
         } catch {

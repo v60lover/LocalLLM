@@ -16,6 +16,10 @@ swiftc -O -swift-version 6 \
   main.swift \
   $ROOT/Sources/Gateway/WorkerSupervisor.swift $ROOT/Sources/Gateway/XPCWorkerConnector.swift \
   $ROOT/Sources/Gateway/GatewayModels.swift $ROOT/Sources/Shared/WorkerIPC.swift \
+  $ROOT/Sources/Gateway/WorkerDigestSummarizer.swift $ROOT/Sources/Gateway/NewsDigest.swift \
+  $ROOT/Sources/Gateway/GatewayEngine.swift $ROOT/Sources/Gateway/DigestSchedule.swift \
+  $ROOT/Sources/Gateway/GatewayStateStore.swift $ROOT/Sources/Gateway/GatewayIPC.swift \
+  $ROOT/Sources/Shared/FileQuarantine.swift \
   -o $APP/Contents/MacOS/LocalLLMGateway
 codesign -f -s - $APP/Contents/XPCServices/LocalLLMWorker.xpc
 codesign -f -s - $APP

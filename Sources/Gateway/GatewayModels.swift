@@ -107,6 +107,16 @@ struct GatewayStatus: Codable, Equatable, Sendable {
     var attemptsToday: Int
     var lastSuccessDay: String?
     var startedAt: Date
+    /// The inference worker's state. Optional: an older Gateway does not send it, and an older
+    /// app ignores it, so the protocol version stays.
+    var worker: WorkerStatus?
+}
+
+/// Worker state as the app sees it in `GatewayStatus`. Plain strings, so a newer Gateway adding
+/// a state does not break an older app's decoding.
+struct WorkerStatus: Codable, Equatable, Sendable {
+    var state: String
+    var isSafeMode: Bool
 }
 
 enum GatewayError: LocalizedError, Equatable, Sendable {
