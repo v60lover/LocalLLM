@@ -93,8 +93,8 @@ private final class XPCWorkerLink: WorkerLink, @unchecked Sendable {
     }
 }
 
-// Safe: `continuation` is only accessed under `lock`, and `take()` hands it out once.
-private final class OnceResumer: @unchecked Sendable {
+// Safe: `continuation` is only accessed under `lock`, and `take()` hands it out once. Also used by `XPCGatewayLink`.
+final class OnceResumer: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Data, Error>?
 

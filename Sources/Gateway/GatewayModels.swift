@@ -2,7 +2,10 @@
 import Foundation
 
 enum GatewayConstants {
-    static let protocolVersion = 1
+    /// App <-> Gateway wire version. 2 added the hello handshake, request IDs with the
+    /// at-most-once ledger, typed failures and pushed events. Bump it for any change an older
+    /// peer cannot decode; an additive optional field (like `GatewayStatus.revision`) needs none.
+    static let protocolVersion = 2
     static let label = "com.example.localllmchat.gateway"
     static let machServiceName = label
     static let executableName = "LocalLLMGateway"
@@ -110,6 +113,10 @@ struct GatewayStatus: Codable, Equatable, Sendable {
     /// The inference worker's state. Optional: an older Gateway does not send it, and an older
     /// app ignores it, so the protocol version stays.
     var worker: WorkerStatus?
+    /// Counts the engine's changes since it started (`startedAt`). Replies and pushes travel
+    /// separately and can arrive out of order; the app keeps the status with the higher
+    /// revision. Optional: a Gateway that does not send it is taken at its word.
+    var revision: Int?
 }
 
 /// Worker state as the app sees it in `GatewayStatus`. Plain strings, so a newer Gateway adding
@@ -136,6 +143,8 @@ enum GatewayError: LocalizedError, Equatable, Sendable {
     case unsupportedProtocol(Int)
     case gatewayUnavailable(String)
     case remote(String)
+    /// The connection dropped while a request was in flight and its outcome could not be recovered.
+    case connectionLost
 
     var errorDescription: String? {
         switch self {
@@ -158,6 +167,8 @@ enum GatewayError: LocalizedError, Equatable, Sendable {
         case .gatewayUnavailable(let detail):
             "The Gateway is not responding. Install or restart it in the settings. \(detail)"
         case .remote(let detail): detail
+        case .connectionLost:
+            "The connection to the Gateway was lost before the request was confirmed. Check the status and try again."
         }
     }
 }

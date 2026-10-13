@@ -342,11 +342,14 @@ final class WorkerStatusTests: XCTestCase {
         )
         let withWorker = GatewayRequestHandler(engine: engine, workerStatus: { WorkerStatus(.safeMode) })
         let without = GatewayRequestHandler(engine: engine)
+        let hello = try GatewayWire.encoder.encode(GatewayRequestEnvelope(request: .hello(version: GatewayConstants.protocolVersion)))
         let request = try GatewayWire.encoder.encode(GatewayRequestEnvelope(request: .status))
 
         let cases: [(GatewayRequestHandler, WorkerStatus?)] = [(withWorker, WorkerStatus(.safeMode)), (without, nil)]
         for (handler, expected) in cases {
-            let data = await handler.handle(request)
+            let connection = GatewayConnectionContext()
+            _ = await handler.handle(hello, connection: connection)
+            let data = await handler.handle(request, connection: connection)
             let reply = try GatewayWire.decoder.decode(GatewayReplyEnvelope.self, from: data).reply
             guard case .status(let status) = reply else { return XCTFail("expected a status reply") }
             XCTAssertEqual(status.worker, expected)

@@ -14,7 +14,7 @@ final class GatewayLiveSmokeTests: XCTestCase {
 
         let installer = GatewayInstaller.bundled()
         try await installer.install()
-        let client = GatewayXPCClient()
+        let client = GatewayClient()
         var restored = false
         defer {
             if !restored { Task { try? await installer.uninstall() } }

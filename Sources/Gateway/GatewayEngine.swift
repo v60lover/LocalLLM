@@ -20,14 +20,32 @@ actor GatewayEngine {
     private let clock: any GatewayClock
     private let timeout: Duration
     private let startedAt: Date
+    /// Told after every change a client could see: config, run started, run finished, and a
+    /// status field that moved with the clock (see `TimeDerived`).
+    private let observer: (any GatewayChangeObserver)?
     private let log = Logger(subsystem: GatewayConstants.label, category: "engine")
     private var state: GatewayPersistedState
     private var runTask: Task<Void, Never>?
+    /// Bumped with every reported change; lets a client order statuses it got on different paths.
+    /// In memory only: it restarts at 0 with the process, which is why the client compares it
+    /// together with `startedAt`.
+    private var revision = 0
+    /// The clock-driven fields as of the last report; nil until the first `tick()`.
+    private var reportedTimeDerived: TimeDerived?
+
+    /// The status fields that change with the clock alone (time zone, midnight), without any
+    /// request or run. `tick()` reports a change of these, since nobody polls the status.
+    private struct TimeDerived: Equatable {
+        var timeZoneID: String
+        var nextRun: Date?
+        var attemptsToday: Int
+    }
 
     init(
         store: GatewayStateStore, job: any GatewayJob, clock: any GatewayClock = SystemGatewayClock(),
-        timeout: Duration = .seconds(900)
+        timeout: Duration = .seconds(900), observer: (any GatewayChangeObserver)? = nil
     ) {
+        self.observer = observer
         self.store = store
         self.job = job
         self.clock = clock
@@ -53,7 +71,8 @@ actor GatewayEngine {
             lastRun: state.inFlight ?? state.lastRun,
             attemptsToday: state.progress.attemptDay == today ? state.progress.attempts : 0,
             lastSuccessDay: state.progress.lastSuccessDay,
-            startedAt: startedAt
+            startedAt: startedAt,
+            revision: revision
         )
     }
 
@@ -74,9 +93,11 @@ actor GatewayEngine {
             state.progress.lastSuccessDay = nil
         }
         try persist()
+        reportChange()
     }
 
-    /// Starts a run in the background and returns immediately; poll `status()` for the result.
+    /// Starts a run in the background and returns immediately; the observer is told when it
+    /// starts and when it finishes.
     func startRun(_ trigger: RunTrigger) throws {
         guard runTask == nil else { throw GatewayError.alreadyRunning }
         let now = clock.now
@@ -89,6 +110,7 @@ actor GatewayEngine {
             let outcome = await perform(config: config, now: now)
             finish(record, outcome: outcome)
         }
+        reportChange()
     }
 
     func cancelRun() {
@@ -98,11 +120,21 @@ actor GatewayEngine {
     /// One scheduler evaluation. Safe to call as often as desired; a run is only started when
     /// the policy says it is due and nothing is already running.
     func tick() {
-        guard runTask == nil else { return }
-        let decision = DigestSchedule.decide(
-            now: clock.now, config: state.config, progress: state.progress, calendar: clock.calendar
-        )
-        if case .due(let trigger) = decision { try? startRun(trigger) }
+        // Scheduling is skipped while a run is active; the report below is not, because the
+        // clock-driven fields can change during a run as well.
+        if runTask == nil {
+            let decision = DigestSchedule.decide(
+                now: clock.now, config: state.config, progress: state.progress, calendar: clock.calendar
+            )
+            if case .due(let trigger) = decision { try? startRun(trigger) }
+        }
+        // Nobody polls the status, so a field that moved with the clock alone (new
+        // day, new time zone) has to be reported from here. A run started just above has
+        // already reported and refreshed the baseline, so it is not reported twice.
+        // The first evaluation only records the baseline.
+        let current = timeDerived()
+        if let reported = reportedTimeDerived, reported != current { reportChange() }
+        reportedTimeDerived = current
     }
 
     func waitUntilIdle() async {
@@ -166,6 +198,7 @@ actor GatewayEngine {
         }
         do { try persist() } catch { log.error("persist failed: \(error.localizedDescription, privacy: .public)") }
         runTask = nil
+        reportChange()
         log.info("run finished trigger=\(record.trigger.rawValue, privacy: .public)")
     }
 
@@ -198,6 +231,25 @@ actor GatewayEngine {
 
     private func persist() throws {
         try store.save(state)
+    }
+
+    /// Taken from `status()` rather than recomputed, so it cannot drift from what clients see.
+    private func timeDerived() -> TimeDerived {
+        let current = status()
+        return TimeDerived(
+            timeZoneID: current.timeZoneID, nextRun: current.nextRun, attemptsToday: current.attemptsToday
+        )
+    }
+
+    /// The single way a change leaves the engine. Every mutation a client could see must end
+    /// here: a change that skips it is neither pushed nor counted in `revision`, and the
+    /// settings window keeps showing the old status.
+    private func reportChange() {
+        revision += 1
+        // Refresh the baseline, so the next `tick()` does not report this change again.
+        reportedTimeDerived = timeDerived()
+        // Synchronous and cheap by contract (`GatewayChangeObserver`): it only schedules work.
+        observer?.gatewayDidChange()
     }
 }
 #endif

@@ -60,9 +60,15 @@ Log: unified logging, subsystem `com.example.localllmchat.gateway` (`log stream 
 
 #### IPC
 
-The app and the Gateway talk over XPC (mach service `com.example.localllmchat.gateway`). A single method, `send(Data, reply:)`, carries a JSON envelope with a protocol `version` (currently 1), so the wire format can evolve without changing the Objective-C protocol.
+The app and the Gateway talk over XPC (mach service `com.example.localllmchat.gateway`), protocol version 2. A single method, `send(Data, reply:)`, carries a JSON envelope `{version, requestID, request}`, so the wire format can evolve without changing the Objective-C protocol. The app also exports a second object, `GatewayEventSinkXPC`, on the same connection, through which the Gateway pushes events.
 
-Requests: `status`, `updateConfig`, `runNow`, `cancelRun`. Every reply is either the current `GatewayStatus` or an error message. `runNow` returns immediately; the app polls the status every 2 seconds to follow progress. `GatewayStatus.worker` carries the worker's state (`idle`, `starting`, `ready`, `restarting`, `safeMode`); it is optional, so builds on either side that do not know it still talk to each other.
+- **Handshake.** The first request on a connection is `hello(version)`; the reply carries the Gateway's version and an `instanceID` (one per Gateway process). Anything sent before `hello` is answered with `handshakeRequired`. A peer on another protocol version gets a typed `unsupportedProtocol` failure (a protocol 1 app receives it in the shape it reads, so it shows "Reinstall the Gateway from the app"); there is no dual-stack support.
+- **Requests:** `hello`, `status`, `updateConfig`, `runNow`, `cancelRun`, `ping`, `requestStatus(id)`. Every reply is a typed value: the status, `pong`, the request's state, or `failure(kind, message)`.
+- **Request IDs.** A mutating request (`updateConfig`, `runNow`, `cancelRun`) is executed at most once per `requestID`: the Gateway keeps the last 128 outcomes in memory, answers a duplicate with the stored reply and `requestStatus` with `completed`, `inProgress` or `unknown`. After a lost connection the client reconnects and looks the outcome up; it never re-sends a mutating request. If the Gateway process changed in between (or the entry was evicted), the call fails with "connection lost" and the UI shows the fresh status.
+- **Push.** The Gateway pushes its full status after every change (config saved, run started, run finished, and a field that moved with the clock alone: time zone, next run, the day's attempt count; that last kind is noticed within 30 s) in batches with a strictly increasing `sequence`. Publishes never overlap, so the last status pushed is the newest. The status carries a `revision` that grows with every change; replies and pushes travel separately, and the app drops a status older than the one it already shows. Only the latest status is kept per subscriber and one batch is in flight until acknowledged; an app that does not acknowledge within 10 s is dropped. A gap in the sequence or an undecodable batch makes the app reconnect (status is a snapshot, so that repairs it). Unknown event types are skipped, so the event set can grow.
+- **Liveness.** The app keeps one connection, pings every 5 s (5 s timeout), and on a hung or interrupted Gateway closes the connection and reconnects: the first attempt follows within 5 s, further ones every 2 s. Requests time out after 10 s; cancelling the caller does not interrupt a request already sent. There is no polling of the status. The client lives as long as the settings window: closing it sends a pending edit, then closes the connection for good.
+
+`GatewayStatus.worker` carries the worker's state (`idle`, `starting`, `ready`, `restarting`, `safeMode`); it is optional, so builds on either side that do not know it still talk to each other. It is refreshed with every reply and push, but a change of the worker state alone does not trigger a push.
 
 The Gateway and the worker use a second, separately versioned contract (`WorkerIPC.swift`, protocol version 1): one `send(Data, reply:)` method for requests, and a client-exported event sink through which the worker streams output in coalesced batches, one batch in flight until acknowledged.
 
@@ -70,7 +76,8 @@ The Gateway and the worker use a second, separately versioned contract (`WorkerI
 
 ```
 GatewayMain                      XPC listener + scheduler loop + main run loop (wake)
- └─ GatewayRequestHandler        decodes the envelope, checks the protocol version
+ ├─ GatewayEventPublisher (actor) pushes the status to subscribed connections, one batch in flight
+ └─ GatewayRequestHandler        handshake, protocol version, request-ID ledger; per-connection state
      └─ GatewayEngine (actor)    schedule, state, exactly one active run
          ├─ DigestSchedule       pure policy: when is a run due?
          ├─ GatewayStateStore    state.json (config, daily progress, last run)
@@ -96,7 +103,7 @@ GatewayMain                      XPC listener + scheduler loop + main run loop (
 
 #### What is injectable in tests
 
-The clock (`GatewayClock`), news fetching, summarization (the worker behind `DigestWorkerRunning`, the model cache behind `ModelLocating`), document publishing and launchd command execution all sit behind protocols. Scheduling, restart, deduplication and retries can therefore be tested deterministically, without a network, a model or Pages.
+The clock (`GatewayClock`), the app's connection to the Gateway (`GatewayConnecting` / `GatewayLink`), event delivery (`GatewayEventSending`), news fetching, summarization (the worker behind `DigestWorkerRunning`, the model cache behind `ModelLocating`), document publishing and launchd command execution all sit behind protocols. Scheduling, restart, deduplication and retries can therefore be tested deterministically, without a network, a model or Pages.
 
 #### Limitations
 
@@ -104,4 +111,4 @@ The clock (`GatewayClock`), news fetching, summarization (the worker behind `Dig
 - The Automation permission for Pages is tied to the Gateway's code signature. If the signature changes, the permission has to be granted again.
 - Neither XPC peer is authenticated: the Gateway's listener does not verify the app's code signature, and the worker does not verify the Gateway's. The service is only reachable inside the user's own launchd domain; add a code-signing requirement if stricter checking is needed.
 
-Verification: `xcodebuild test` covers scheduling (including time zones and daylight saving), restart and deduplication, retries, timeout, cancellation, RSS/Atom feeds with a mocked network, the pipeline with mocked model and Pages, IPC and the installer. An opt-in end-to-end test (`TEST_RUNNER_GATEWAY_LIVE_SMOKE=1`) drives the real launchd agent, cached model and Pages.
+Verification: `xcodebuild test` covers scheduling (including time zones and daylight saving), restart and deduplication, retries, timeout, cancellation, RSS/Atom feeds with a mocked network, the pipeline with mocked model and Pages, the app<->Gateway protocol (handshake, version skew, request IDs, push backpressure, heartbeat, reconnect) and the installer. An opt-in end-to-end test (`TEST_RUNNER_GATEWAY_LIVE_SMOKE=1`) drives the real launchd agent, cached model and Pages. Not live-verified: push events and reconnect across a real launchd restart (covered with an in-process loopback Gateway only).

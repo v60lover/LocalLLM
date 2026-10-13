@@ -3,7 +3,7 @@ import XCTest
 
 #if os(macOS)
 /// Manually advanced clock; sleepers resume when `advance` passes their deadline.
-private final class SupervisorFakeClock: SupervisorClock, @unchecked Sendable {
+final class SupervisorFakeClock: SupervisorClock, @unchecked Sendable {
     private let lock = NSLock()
     private var time = Duration.zero
     private var waiters: [UUID: (deadline: Duration, continuation: CheckedContinuation<Void, Error>)] = [:]

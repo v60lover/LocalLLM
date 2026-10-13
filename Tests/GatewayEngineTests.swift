@@ -23,6 +23,62 @@ final class GatewayEngineTests: XCTestCase {
         return engine
     }
 
+    // MARK: Change reports
+
+    /// Counts the engine's change reports.
+    private final class ChangeCounter: GatewayChangeObserver, @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        var count: Int { lock.withLock { value } }
+        func gatewayDidChange() { lock.withLock { value += 1 } }
+    }
+
+    /// Nothing polls the status, so a change caused by the clock alone has to be reported by
+    /// the engine itself, once, and without starting a run.
+    func testAStatusFieldThatMovesWithTheClockAloneIsReportedOnTheNextTick() async throws {
+        let clock = FakeClock(testDate(2026, 10, 2, 6))
+        let changes = ChangeCounter()
+        let engine = GatewayEngine(store: store, job: StubJob(), clock: clock, observer: changes)
+        try await engine.updateConfig(enabledConfig(hour: 9))
+        await engine.tick()
+        XCTAssertEqual(changes.count, 1, "nothing moved since the config was saved")
+
+        // 06:00 in Moscow is 04:00 in London: the 09:00 slot is still ahead, so no run starts,
+        // but the time zone and the next run shown to the user are different now.
+        clock.setZone("Europe/London")
+        await engine.tick()
+        XCTAssertEqual(changes.count, 2)
+        let moved = await engine.status()
+        XCTAssertEqual(moved.timeZoneID, "Europe/London")
+        XCTAssertEqual(moved.revision, 2)
+
+        await engine.tick()
+        XCTAssertEqual(changes.count, 2, "reported once, not on every tick")
+        let job = await engine.status()
+        XCTAssertFalse(job.isRunning)
+    }
+
+    /// The revision is what lets the app order a reply against a push, so every reported
+    /// change must raise it by exactly one.
+    func testEveryReportedChangeRaisesTheStatusRevision() async throws {
+        let changes = ChangeCounter()
+        let engine = GatewayEngine(
+            store: store, job: StubJob(), clock: FakeClock(testDate(2026, 10, 2, 6)), observer: changes
+        )
+        let initial = await engine.status()
+        XCTAssertEqual(initial.revision, 0)
+
+        try await engine.updateConfig(enabledConfig())
+        let saved = await engine.status()
+        try await engine.startRun(.manual)
+        let started = await engine.status()
+        await engine.waitUntilIdle()
+        let finished = await engine.status()
+
+        XCTAssertEqual([saved.revision, started.revision, finished.revision], [1, 2, 3])
+        XCTAssertEqual(changes.count, 3)
+    }
+
     func testUnreadableStateIsMovedAsideInsteadOfOverwritten() throws {
         try Data("not json".utf8).write(to: store.fileURL)
 

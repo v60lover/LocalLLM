@@ -13,21 +13,30 @@ final class GatewaySettingsModel {
     private(set) var isInstalled = false
     private(set) var errorMessage: String?
     private(set) var isWorking = false
-    /// Why the last automatic save was rejected. Unlike `errorMessage` it is not cleared by polling.
+    /// Why the last automatic save was rejected. Unlike `errorMessage` it is not cleared by status updates.
     private(set) var saveError: String?
 
-    private let client: any GatewayControlling
+    /// Created on first use: SwiftUI builds this model more often than it keeps one, and a
+    /// client that is never used must not exist.
+    @ObservationIgnored private lazy var client: any GatewayControlling = makeClient()
+    @ObservationIgnored private let makeClient: () -> any GatewayControlling
     private let installer: GatewayInstaller
-    private var pollTask: Task<Void, Never>?
+    /// Reads `client.events` while the window is open; cancelled in `stop()`.
+    private var eventsTask: Task<Void, Never>?
     private var draftLoaded = false
     var currentModel: ModelReference?
     private var saveTask: Task<Void, Never>?
+    /// The newest status seen from one Gateway process (`startedAt` identifies it).
+    @ObservationIgnored private var newest: (startedAt: Date, revision: Int)?
 
+    /// The model owns `client` for the lifetime of the window and stops it in `stop()`.
+    /// `client` is an autoclosure and has no default: the call site names the client it wants,
+    /// and writing `GatewayClient()` there does not create one until it is first used.
     init(
-        client: any GatewayControlling = GatewayXPCClient(),
+        client: @escaping @autoclosure () -> any GatewayControlling,
         installer: GatewayInstaller = .bundled()
     ) {
-        self.client = client
+        makeClient = client
         self.installer = installer
     }
 
@@ -49,24 +58,59 @@ final class GatewaySettingsModel {
         return isDirty ? .saving : .saved
     }
 
+    /// Follows the Gateway through pushed events; there is no polling. The client keeps the
+    /// connection alive (heartbeat, reconnect) and reports `connected` / `disconnected`.
     func start() {
-        guard pollTask == nil else { return }
-        pollTask = Task {
-            while !Task.isCancelled {
-                await refresh()
-                try? await Task.sleep(for: .seconds(2))
+        guard eventsTask == nil else { return }
+        let client = client
+        // The task holds the client, not the model: a window that goes away without `stop()`
+        // does not stay alive because of its own event loop.
+        eventsTask = Task { [weak self] in
+            await client.start()
+            // Ask once up front, so the window fills in without waiting for the first push.
+            await self?.refresh()
+            // Ends when the client is stopped (the stream finishes) or the task is cancelled.
+            for await event in client.events {
+                guard !Task.isCancelled, let self else { return }
+                await self.handle(event)
             }
         }
     }
 
+    /// Applies one client event to what the window shows.
+    func handle(_ event: GatewayClientEvent) async {
+        switch event {
+        case .connected:
+            // A new connection, possibly to a restarted Gateway: read the status afresh.
+            await refresh()
+        case .status(let latest):
+            // Install state is re-read on every event; nothing else refreshes it.
+            isInstalled = installer.isInstalled
+            apply(latest)
+            // A status arriving proves the Gateway is reachable again. An error from an
+            // action still in progress is left for that action to settle.
+            if errorMessage != nil, !isWorking { errorMessage = nil }
+        case .disconnected(let reason):
+            isInstalled = installer.isInstalled
+            // No status means "not reachable": the sections that need the Gateway are hidden.
+            status = nil
+            errorMessage = reason
+        }
+    }
+
+    /// Called when the window closes. The client is not usable afterwards.
     func stop() {
-        pollTask?.cancel()
-        pollTask = nil
+        eventsTask?.cancel()
+        eventsTask = nil
         // Edits are applied automatically; make sure a pending one is not lost on close.
-        if saveTask != nil {
-            saveTask?.cancel()
-            saveTask = nil
-            Task { await save(model: nil) }
+        let hasPendingSave = saveTask != nil
+        saveTask?.cancel()
+        saveTask = nil
+        let client = client
+        Task {
+            // Stopping the client is final, so the last save goes first.
+            if hasPendingSave { await save(model: nil) }
+            await client.stop()
         }
     }
 
@@ -92,19 +136,33 @@ final class GatewaySettingsModel {
     func refresh() async {
         isInstalled = installer.isInstalled
         do {
-            let latest = try await client.send(.status)
-            status = latest
-            if !draftLoaded {
-                draft = latest.config
-                draftLoaded = true
-                adopt(model: currentModel)
-            }
+            apply(try await client.send(.status))
         } catch {
             status = nil
             errorMessage = error.localizedDescription
             return
         }
         if errorMessage != nil, !isWorking { errorMessage = nil }
+    }
+
+    /// Replies and pushed events arrive on separate paths with no order between them; a status
+    /// older than one already shown (same Gateway process, lower revision) is dropped.
+    private func apply(_ latest: GatewayStatus) {
+        // A Gateway that sends no revision is taken at its word: there is nothing to compare.
+        if let revision = latest.revision {
+            // Revisions restart at 0 with the Gateway process, so they are only compared
+            // within one process; a different `startedAt` always wins.
+            if let newest, newest.startedAt == latest.startedAt, revision < newest.revision { return }
+            newest = (latest.startedAt, revision)
+        }
+        status = latest
+        // The draft is taken from the Gateway once. After that it belongs to the user, and
+        // later statuses must not overwrite what they are typing.
+        if !draftLoaded {
+            draft = latest.config
+            draftLoaded = true
+            adopt(model: currentModel)
+        }
     }
 
     func save(model: ModelReference?) async {
@@ -114,7 +172,7 @@ final class GatewaySettingsModel {
         isWorking = true
         defer { isWorking = false }
         do {
-            status = try await client.send(.updateConfig(config))
+            apply(try await client.send(.updateConfig(config)))
             saveError = nil
             errorMessage = nil
         } catch {
@@ -167,7 +225,7 @@ final class GatewaySettingsModel {
         isWorking = true
         defer { isWorking = false }
         do {
-            status = try await action()
+            apply(try await action())
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
@@ -180,7 +238,7 @@ struct GatewaySettingsView: View {
     let currentModelName: String?
     let currentModelIsCached: Bool
     @Environment(\.dismiss) private var dismiss
-    @State private var model = GatewaySettingsModel()
+    @State private var model = GatewaySettingsModel(client: GatewayClient())
 
     var body: some View {
         NavigationStack {
