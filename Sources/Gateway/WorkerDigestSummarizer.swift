@@ -1,5 +1,5 @@
-#if os(macOS)
 import Foundation
+import OSLog
 
 /// What the summarizer needs from the worker's owner. `WorkerSupervisor` conforms; tests use a stub.
 protocol DigestWorkerRunning: Sendable {
@@ -37,25 +37,44 @@ struct WorkerDigestSummarizer: DigestSummarizing {
 
     let worker: any DigestWorkerRunning
     let locator: any ModelLocating
+    private let log = Logger(subsystem: GatewayConstants.label, category: "digest")
 
     func summarize(items: [NewsItem], model: ModelReference) async throws -> DigestSummary {
         guard let path = locator.localPath(for: model) else {
             throw GatewayError.modelNotDownloaded(model.catalogID)
         }
+        log.info("digest: summarizing \(items.count, privacy: .public) items, model at \(path, privacy: .public)")
         await worker.leaveSafeMode()
         let location = WorkerModelLocation.path(path)
         do {
             var good: [NewsItem] = []
-            for item in items {
+            for (index, item) in items.enumerated() {
                 try Task.checkCancellation()
-                if try await isGoodNews(item, location: location) {
-                    good.append(item)
-                }
+                let began = ContinuousClock.now
+                let verdict = try await isGoodNews(item, location: location)
+                if verdict { good.append(item) }
+                log.info("""
+                    digest: verdict \(index + 1, privacy: .public)/\(items.count, privacy: .public) \
+                    good=\(verdict, privacy: .public) \
+                    took \(began.duration(to: .now).description, privacy: .public) \
+                    [\(item.source, privacy: .public)] \(item.title, privacy: .public)
+                    """)
             }
             guard !good.isEmpty else { throw GatewayError.noGoodNews }
+            let began = ContinuousClock.now
             let text = try await digest(good, location: location)
+            log.info("""
+                digest: written from \(good.count, privacy: .public) items, \
+                \(text.count, privacy: .public) chars, \
+                took \(began.duration(to: .now).description, privacy: .public)
+                """)
             return DigestSummary(text: text, items: good)
         } catch {
+            if error is CancellationError {
+                log.info("digest: cancelled")
+            } else {
+                log.error("digest: worker stage failed: \(String(describing: error), privacy: .public)")
+            }
             throw Self.mapped(error)
         }
     }
@@ -78,6 +97,7 @@ struct WorkerDigestSummarizer: DigestSummarizing {
         do {
             return try await respond(items, location: location)
         } catch let error where Self.isTooMuchForTheModel(error) {
+            log.info("digest: retrying with fewer items after \(String(describing: error), privacy: .public)")
             // A thinking-only answer can run out of tokens, or the list can overflow the context;
             // retry once with fewer items.
             return try await respond(Array(items.prefix(max(4, items.count / 2))), location: location)
@@ -153,4 +173,3 @@ struct WorkerDigestSummarizer: DigestSummarizing {
         }
     }
 }
-#endif

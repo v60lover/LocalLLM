@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 import OSLog
 
@@ -40,4 +39,3 @@ struct GatewayStateStore: Sendable {
         try GatewayWire.encoder.encode(state).write(to: fileURL, options: .atomic)
     }
 }
-#endif

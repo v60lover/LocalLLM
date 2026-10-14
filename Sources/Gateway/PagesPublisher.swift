@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 
 /// Creates a `.pages` document through Pages' scripting interface and leaves it open.
@@ -97,4 +96,3 @@ enum ProcessRunner {
         }
     }
 }
-#endif

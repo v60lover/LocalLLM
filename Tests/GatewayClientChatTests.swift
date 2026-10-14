@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 import XCTest
 @testable import LocalLLMChat
@@ -227,4 +226,3 @@ final class GatewayClientChatTests: XCTestCase {
         XCTAssertEqual(generates.count, 1)
     }
 }
-#endif

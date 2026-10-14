@@ -150,7 +150,6 @@ private struct CoreAIModelHandle: ChatModelHandle {
     }
 }
 
-#if os(macOS)
 extension CoreAIBackend {
     /// Makes sure the model is on disk and says where the Gateway finds it, without loading it
     /// into this process: the Gateway's worker is the one that loads and runs it.
@@ -167,4 +166,3 @@ extension CoreAIBackend {
         return (reference, Self.readContextSize(from: url))
     }
 }
-#endif

@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 
 enum GatewayConstants {
@@ -185,4 +184,3 @@ struct SystemGatewayClock: GatewayClock {
     var now: Date { Date() }
     var calendar: Calendar { Calendar.autoupdatingCurrent }
 }
-#endif

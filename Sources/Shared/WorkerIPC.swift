@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 
 /// Versioned Gateway <-> Worker contract. Like the app <-> Gateway contract, one XPC method
@@ -157,4 +156,3 @@ struct WorkerEventQueue: Sendable {
         pending.removeAll { $0.requestID == requestID }
     }
 }
-#endif

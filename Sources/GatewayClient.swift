@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 
 // App side of the app <-> Gateway protocol. Layout of this file:
@@ -551,4 +550,3 @@ private final class XPCGatewayLink: GatewayLink, @unchecked Sendable {
 
     func invalidate() { connection.invalidate() }
 }
-#endif

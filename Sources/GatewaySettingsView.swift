@@ -1,4 +1,3 @@
-#if os(macOS)
 import AppKit
 import Observation
 import SwiftUI
@@ -434,4 +433,3 @@ struct GatewaySettingsView: View {
         if panel.runModal() == .OK, let url = panel.url { model.draft.outputDirectory = url.path }
     }
 }
-#endif

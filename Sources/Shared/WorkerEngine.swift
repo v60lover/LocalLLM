@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 
 /// Model access behind a seam so the worker's session logic is testable without CoreAI.
@@ -170,4 +169,3 @@ actor WorkerEngine: WorkerServing {
         }
     }
 }
-#endif

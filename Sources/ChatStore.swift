@@ -117,14 +117,9 @@ final class ChatStore {
         self.backend = backend
     }
 
-    /// macOS chats through the Gateway so the model lives outside the app process; iOS has no
-    /// Gateway and runs the model in-process.
+    /// Chats go through the Gateway so the model lives outside the app process.
     static func defaultBackend() -> any ChatBackend {
-        #if os(macOS)
         XPCChatBackend()
-        #else
-        CoreAIBackend()
-        #endif
     }
 
     var isGenerating: Bool { generation == .generating }
@@ -160,7 +155,6 @@ final class ChatStore {
         return label
     }
 
-    #if os(macOS)
     /// The selected model in a form the background Gateway can resolve on its own.
     var gatewayModelReference: ModelReference? {
         guard let option = models.first(where: { $0.id == selectedModelID }),
@@ -173,7 +167,6 @@ final class ChatStore {
     var selectedModelName: String? {
         models.first(where: { $0.id == selectedModelID })?.name
     }
-    #endif
 
     func loadCatalog() async {
         guard !didRestore else { return }

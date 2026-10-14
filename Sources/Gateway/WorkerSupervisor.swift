@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 import OSLog
 
@@ -799,4 +798,3 @@ func raceTimeout<T: Sendable>(
         })
     }
 }
-#endif

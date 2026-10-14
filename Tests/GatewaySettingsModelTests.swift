@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 import XCTest
 @testable import LocalLLMChat
@@ -214,4 +213,3 @@ final class GatewaySettingsModelTests: XCTestCase {
         XCTAssertEqual(saved.hour, 21, "the edit reached the Gateway before the connection was closed")
     }
 }
-#endif

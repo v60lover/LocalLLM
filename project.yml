@@ -29,10 +29,8 @@ schemes:
 targets:
   LocalLLMChat:
     type: application
-    supportedDestinations: [iOS, macOS]
-    deploymentTarget:
-      iOS: "27.0"
-      macOS: "27.0"
+    platform: macOS
+    deploymentTarget: "27.0"
     sources:
       - path: Sources
       # launchd job for SMAppService.agent; BundleProgram points into LoginItems/.
@@ -41,14 +39,12 @@ targets:
           copyFiles:
             destination: wrapper
             subpath: Contents/Library/LaunchAgents
-        platformFilter: macOS
     dependencies:
       - package: coreai-kit
         product: CoreAIKit
       - package: SwiftStreamingMarkdown
         product: SwiftStreamingMarkdown
       - target: LocalLLMGateway
-        platformFilters: [macOS]
         embed: true
         codeSign: true
         copy:
@@ -59,7 +55,6 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.localllmchat
         SWIFT_VERSION: "6.0"
         GENERATE_INFOPLIST_FILE: "YES"
-        INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
         CODE_SIGN_STYLE: Automatic
         ENABLE_APP_SANDBOX: "NO"
         MARKETING_VERSION: "1.0"

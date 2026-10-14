@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 import OSLog
 
@@ -168,8 +167,10 @@ actor GatewayEngine {
             }
             return .succeeded(path: output.artifactPath, itemCount: output.itemCount)
         } catch is CancellationError {
+            log.info("run cancelled")
             return .cancelled
         } catch {
+            log.error("run failed: \(error.localizedDescription, privacy: .public)")
             return .failed(message: error.localizedDescription)
         }
     }
@@ -199,7 +200,8 @@ actor GatewayEngine {
         do { try persist() } catch { log.error("persist failed: \(error.localizedDescription, privacy: .public)") }
         runTask = nil
         reportChange()
-        log.info("run finished trigger=\(record.trigger.rawValue, privacy: .public)")
+        let elapsed = Int(record.finishedAt.map { $0.timeIntervalSince(record.startedAt) } ?? 0)
+        log.info("run finished trigger=\(record.trigger.rawValue, privacy: .public) after \(elapsed, privacy: .public)s")
     }
 
     private func registerFailedAttempt(day: String, at date: Date) {
@@ -252,4 +254,3 @@ actor GatewayEngine {
         observer?.gatewayDidChange()
     }
 }
-#endif

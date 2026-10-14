@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 import FoundationModels
 
@@ -44,4 +43,3 @@ private struct RemoteModelHandle: ChatModelHandle {
         RemoteChatRuntime(model: model, transcript: transcript, session: session)
     }
 }
-#endif

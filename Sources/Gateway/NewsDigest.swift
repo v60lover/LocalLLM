@@ -1,5 +1,5 @@
-#if os(macOS)
 import Foundation
+import OSLog
 
 struct NewsItem: Codable, Equatable, Sendable {
     var title: String
@@ -359,6 +359,7 @@ struct NewsDigestJob: GatewayJob {
     let publisher: any DocumentPublishing
     var policy = NewsPolicy()
     var clock: any GatewayClock = SystemGatewayClock()
+    private let log = Logger(subsystem: GatewayConstants.label, category: "digest")
 
     func run(config: DigestConfig, now: Date) async throws -> JobOutput {
         let sources = config.sourceURLs
@@ -370,12 +371,35 @@ struct NewsDigestJob: GatewayJob {
         }
 
         try Task.checkCancellation()
+        let started = ContinuousClock.now
+        log.info("digest: fetching \(sources.count, privacy: .public) sources")
         let fetched = try await fetcher.fetch(sources: sources)
         let items = NewsPreparation.prepare(fetched.items, policy: policy)
+        log.info("""
+            digest: fetched \(fetched.items.count, privacy: .public) items, \
+            \(items.count, privacy: .public) after preparation, \
+            \(fetched.failures.count, privacy: .public) source failures, \
+            took \(started.duration(to: .now).description, privacy: .public)
+            """)
+        for failure in fetched.failures { log.error("digest: source failed: \(failure, privacy: .public)") }
         guard !items.isEmpty else { throw GatewayError.noNews }
 
         try Task.checkCancellation()
-        let summary = try await summarizer.summarize(items: items, model: model)
+        let summarizing = ContinuousClock.now
+        let summary: DigestSummary
+        do {
+            summary = try await summarizer.summarize(items: items, model: model)
+        } catch {
+            log.error("""
+                digest: summarizing failed after \(summarizing.duration(to: .now).description, privacy: .public): \
+                \(error.localizedDescription, privacy: .public)
+                """)
+            throw error
+        }
+        log.info("""
+            digest: summarized, \(summary.items.count, privacy: .public) good items, \
+            took \(summarizing.duration(to: .now).description, privacy: .public)
+            """)
         guard !summary.items.isEmpty else { throw GatewayError.noGoodNews }
         let document = DigestComposer.compose(
             summary: summary.text, items: summary.items, failures: fetched.failures, date: now,
@@ -386,7 +410,7 @@ struct NewsDigestJob: GatewayJob {
         let url = try await publisher.publish(
             document, into: URL(fileURLWithPath: (directory as NSString).expandingTildeInPath, isDirectory: true)
         )
+        log.info("digest: published \(url.lastPathComponent, privacy: .public), total \(started.duration(to: .now).description, privacy: .public)")
         return JobOutput(artifactPath: url.path, itemCount: summary.items.count)
     }
 }
-#endif

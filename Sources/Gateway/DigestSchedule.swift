@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 
 /// Durable per-day bookkeeping used to avoid duplicate sends and bound retries.
@@ -75,4 +74,3 @@ enum DigestSchedule {
         return slot(onDayOf: tomorrow, config: config, calendar: calendar)
     }
 }
-#endif

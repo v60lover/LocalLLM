@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 
 /// Versioned app <-> Gateway contract (protocol 3). One XPC method carries a JSON envelope so the
@@ -477,4 +476,3 @@ protocol GatewayChatControlling: Sendable {
     func start() async
     func stop() async
 }
-#endif

@@ -2,7 +2,6 @@ import Foundation
 import XCTest
 @testable import LocalLLMChat
 
-#if os(macOS)
 // Tests for the Gateway's half of chat: `GatewayChatService` on its own, then
 // `chatGenerate` / `chatCancel` through the real `GatewayRequestHandler`. The worker, the model
 // locator and the connection's event queue are fakes, so nothing here loads a model or opens
@@ -507,4 +506,3 @@ final class GatewayChatHandlerTests: XCTestCase {
         XCTAssertEqual(failure.kind, .internalError)
     }
 }
-#endif

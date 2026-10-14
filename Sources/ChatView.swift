@@ -5,9 +5,7 @@ struct ChatView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var chat = ChatStore()
     @State private var input = ""
-    #if os(macOS)
     @State private var isGatewayPresented = false
-    #endif
 
     var body: some View {
         VStack(spacing: 0) {
@@ -26,7 +24,6 @@ struct ChatView: View {
         .sheet(isPresented: $chat.isModelPickerPresented) {
             modelPickerSheet
         }
-        #if os(macOS)
         .sheet(isPresented: $isGatewayPresented) {
             GatewaySettingsView(
                 currentModel: chat.gatewayModelReference,
@@ -35,7 +32,6 @@ struct ChatView: View {
             )
         }
         .frame(minWidth: 520, minHeight: 600)
-        #endif
     }
 
     private var modelBar: some View {
@@ -71,9 +67,7 @@ struct ChatView: View {
                         .lineLimit(1)
                 }
                 .disabled(chat.isBusy)
-                #if os(macOS)
                 Button("Digest…") { isGatewayPresented = true }
-                #endif
                 Spacer()
                 if let context = chat.contextLabel {
                     Text(context)

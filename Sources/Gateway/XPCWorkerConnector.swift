@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 
 /// Connects to the worker XPC service embedded in this (Gateway) bundle.
@@ -128,4 +127,3 @@ final class SystemMemoryPressureMonitor: @unchecked Sendable {
 
     deinit { source.cancel() }
 }
-#endif

@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 import OSLog
 
@@ -192,4 +191,3 @@ actor GatewayChatService {
         }
     }
 }
-#endif

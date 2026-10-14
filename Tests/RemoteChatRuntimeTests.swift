@@ -1,4 +1,3 @@
-#if os(macOS)
 import FoundationModels
 import XCTest
 @testable import LocalLLMChat
@@ -466,4 +465,3 @@ final class RemoteChatStoreTests: XCTestCase {
         XCTAssertGreaterThan(store.conversations.first?.droppedTurns ?? 0, 0)
     }
 }
-#endif

@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 import FoundationModels
 
@@ -148,4 +147,3 @@ final class RemoteChatRuntime: ChatRuntime {
         }
     }
 }
-#endif

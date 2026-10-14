@@ -82,11 +82,7 @@ final class AgentRuntime: ChatRuntime {
         }
     }
 
-    #if os(iOS)
-    let responseTokenBudget = 896
-    #else
     let responseTokenBudget = 2048
-    #endif
 
     func generate(
         prompt: String,

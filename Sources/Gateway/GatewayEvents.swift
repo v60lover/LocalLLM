@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 import OSLog
 
@@ -352,4 +351,3 @@ actor GatewayEventPublisher: GatewayChangeObserver {
         subscribers[id]?.pumping = false
     }
 }
-#endif

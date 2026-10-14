@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 import XCTest
 @testable import LocalLLMChat
@@ -978,4 +977,3 @@ final class GatewayEventTests: XCTestCase {
         XCTAssertEqual(sink.batches.count, 1)
     }
 }
-#endif

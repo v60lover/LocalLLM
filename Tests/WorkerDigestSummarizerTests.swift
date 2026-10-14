@@ -1,7 +1,6 @@
 import XCTest
 @testable import LocalLLMChat
 
-#if os(macOS)
 /// Records every job and answers through a scripted behavior; stands in for `WorkerSupervisor`.
 private final class StubWorker: DigestWorkerRunning, @unchecked Sendable {
     typealias Behavior = @Sendable (WorkerJob, Int) async throws -> String
@@ -356,4 +355,3 @@ final class WorkerStatusTests: XCTestCase {
         }
     }
 }
-#endif

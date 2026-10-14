@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 import ServiceManagement
 
@@ -129,4 +128,3 @@ struct GatewayInstaller: Sendable {
         try? FileManager.default.removeItem(at: legacyPlistURL)
     }
 }
-#endif
